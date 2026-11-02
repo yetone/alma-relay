@@ -357,7 +357,8 @@ function respondJson(res, status, obj, extraHeaders = {}) {
  * Refuse the rest of a request body without losing the reply: a socket torn
  * down the moment the reply is written can reach a phone still uploading as
  * EPIPE instead of the status. Discard what keeps coming for a moment, then
- * hang up.
+ * hang up. Don't send Connection: close with the reply: Node destroys the
+ * socket as soon as it finishes, which is the teardown this avoids.
  */
 function dropAfterReply(req, res) {
     req.on('data', () => {});
@@ -449,14 +450,14 @@ const server = createServer((req, res) => {
         if (size > MAX_BODY) {
             aborted = true;
             release();
-            respondJson(res, 413, { error: 'Request body too large' }, { Connection: 'close' });
+            respondJson(res, 413, { error: 'Request body too large' });
             dropAfterReply(req, res);
             return;
         }
         if (MAX_BUFFERED && bufferedBodies + chunk.length > MAX_BUFFERED) {
             aborted = true;
             release();
-            respondJson(res, 503, { error: 'Relay is busy, try again shortly' }, { Connection: 'close' });
+            respondJson(res, 503, { error: 'Relay is busy, try again shortly' });
             dropAfterReply(req, res);
             return;
         }
@@ -570,7 +571,6 @@ function streamRequest(agent, req, res, path) {
         if (!live()) return upload.stop(); // the desktop already answered, or gave up
         size += chunk.length;
         if (size > MAX_BODY) {
-            res.setHeader('Connection', 'close');
             fail(413, 'Request body too large');
             dropAfterReply(req, res);
             return;
