@@ -14,6 +14,7 @@
 import { spawn } from 'node:child_process';
 import { createServer, get as httpGet } from 'node:http';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -263,6 +264,8 @@ for (const PROTO of [1, 2]) {
     try {
         const health = await (await fetch(`${relay.origin}/healthz`)).json();
         check('GET /healthz', health.ok === true, JSON.stringify(health));
+        const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+        check('healthz reports the package version', health.version === pkg.version, `${health.version} vs ${pkg.version}`);
 
         const agent = await connected({ relay: relay.origin, code: CODE, wopenDelayMs: 150, proto: offer });
         check('desktop registers', true);

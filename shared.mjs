@@ -2,7 +2,7 @@
 // Everything here uses WebCrypto + standard globals, so it runs unchanged in
 // Node >= 20 and inside a Worker.
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 // ---------------------------------------------------------------------------
 // Agent protocol versions (docs/PROTOCOL.md).
