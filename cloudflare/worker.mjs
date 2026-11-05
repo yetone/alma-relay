@@ -55,7 +55,25 @@ const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
-const sleep = ms => new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms));
+/**
+ * The next result of `read`, or TIMEOUT after COALESCE_MS. The window's
+ * timer is cleared whichever side wins: pumpBody races every coalesced read
+ * against this, and a buffered body answers `read` in microtasks, so one
+ * uncleared 10 ms timer per iteration would exhaust workerd's 10 000 active
+ * timers mid-upload — the pump throws, the phone gets a spurious 400, and
+ * the connection dies reading a body after the response was sent.
+ */
+const readWithin = async read => {
+    let handle;
+    const windowed = new Promise(resolve => {
+        handle = setTimeout(() => resolve(TIMEOUT), COALESCE_MS);
+    });
+    try {
+        return await Promise.race([read, windowed]);
+    } finally {
+        clearTimeout(handle);
+    }
+};
 
 function concatBytes(parts, length) {
     const out = new Uint8Array(length);
@@ -512,7 +530,7 @@ export class TunnelDO extends DurableObject {
         let read = reader.read();
         try {
             for (;;) {
-                const next = pendingBytes ? await Promise.race([read, sleep(COALESCE_MS)]) : await read;
+                const next = pendingBytes ? await readWithin(read) : await read;
                 if (next === TIMEOUT) {
                     if (!(await flush())) return giveUp();
                     continue;
