@@ -124,6 +124,12 @@ const backend = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'text/plain' });
         return res.end('early');
     }
+    if (req.url === '/api/early-open') {
+        // Sends the head, then holds the response open without ever reading
+        // the body: the phone keeps uploading into an answered request.
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        return res.write('early');
+    }
     if (req.url === '/api/empty') {
         res.writeHead(204);
         return res.end();
@@ -709,6 +715,20 @@ if (!EXTERNAL || ARGS.includes('--protocol2')) {
         check('streamed body over MAX_BODY_MB → 413', res.status === 413, `${res.status} ${res.body}`);
         const after = await fetch(`${small.origin}/c/${CODE2}/api/health`);
         check('…and the tunnel still works', after.status === 200, `status=${after.status}`);
+        // The desktop may answer before the body ends (PROTOCOL.md), so the
+        // 413 lands on a response head that is already on the wire. That
+        // used to call setHeader after writeHead, which threw
+        // ERR_HTTP_HEADERS_SENT out of the data listener and killed the
+        // relay process.
+        const early = streamingUpload(`${small.origin}/c/${CODE2}/api/early-open`, (MAX_MB + 2) * 1024 * 1024, { pauseAfterFirstMs: 500 * SLACK });
+        const earlyRes = await Promise.race([
+            early.response.catch(e => ({ status: 0, body: String(e?.cause?.code || e) })),
+            sleep(8000 * SLACK).then(() => ({ status: 'hung' })),
+        ]);
+        const alive = await fetch(`${small.origin}/healthz`).then(r => r.ok, () => false);
+        check('413 after the desktop answered: the relay survives', alive && earlyRes.status !== 'hung', `phone=${earlyRes.status} alive=${alive}`);
+        const afterEarly = await fetch(`${small.origin}/c/${CODE2}/api/health`);
+        check('…and the tunnel still works after the early 413', afterEarly.status === 200, `status=${afterEarly.status}`);
         agent.close();
     } catch (e) {
         check('suite: protocol 2 limits', false, e.stack);

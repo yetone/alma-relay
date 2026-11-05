@@ -583,7 +583,13 @@ function streamRequest(agent, req, res, path) {
         if (!live()) return upload.stop(); // the desktop already answered, or gave up
         size += chunk.length;
         if (size > MAX_BODY) {
-            res.setHeader('Connection', 'close');
+            // No `Connection: close` here, for two reasons. The desktop may
+            // have answered already (hres), so the head is on the wire and
+            // setHeader would throw ERR_HTTP_HEADERS_SENT out of this
+            // listener and take the process down. And closing the socket
+            // with the reply cuts the upload short, so a phone still
+            // uploading sees EPIPE instead of the status — the non-streamed
+            // path above already answers without it.
             fail(413, 'Request body too large');
             dropAfterReply(req, res);
             return;
