@@ -72,6 +72,9 @@ const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its s
 const HIGH_WATER = 8 * MB;
 const LOW_WATER = 1 * MB;
 const FLOW_TICK_MS = 25;
+// How many stall windows an upload may sit out while the relay itself holds
+// the agent socket (a slow phone download) before it is failed anyway.
+const MAX_DEFERRALS = 5;
 
 // ---------------------------------------------------------------------------
 // APNs (optional). With no key the relay answers `unsupported` and the
@@ -303,13 +306,15 @@ class Agent {
  * anything holds it: no credit left, or a backed-up agent socket.
  */
 class Upload {
-    constructor(req, onStall) {
+    constructor(req, onStall, deferred) {
         this.req = req;
         this.onStall = onStall;
+        this.deferred = deferred; // () => the relay itself is holding the socket
         this.credit = BODY_WINDOW;
         this.holds = new Set();
         this.done = false;
         this.stallTimer = null;
+        this.deferrals = 0; // stall windows the relay's own backpressure used up
     }
 
     hold(reason) {
@@ -335,7 +340,23 @@ class Upload {
         this.credit -= n;
         if (this.credit > 0 || this.holds.has('credit')) return;
         this.hold('credit');
-        if (STALL_MS) this.stallTimer = setTimeout(() => this.onStall(), STALL_MS);
+        this.armStall();
+    }
+
+    armStall() {
+        if (!STALL_MS) return;
+        this.stallTimer = setTimeout(() => {
+            // The relay may be the reason no ack arrives: a paused agent
+            // socket (a slow phone download) leaves the desktop's hack
+            // frames unread, so credit cannot refill through it. Look again
+            // after another window instead of blaming the desktop — but not
+            // forever, a request may not wait on a paused socket for good.
+            if (this.deferrals < MAX_DEFERRALS && this.deferred?.()) {
+                this.deferrals++;
+                return this.armStall();
+            }
+            this.onStall();
+        }, STALL_MS);
     }
 
     refund(n) {
@@ -575,7 +596,7 @@ function streamRequest(agent, req, res, path) {
         return;
     }
 
-    const upload = new Upload(req, () => fail(504, 'Desktop stopped reading the request body'));
+    const upload = new Upload(req, () => fail(504, 'Desktop stopped reading the request body'), () => agent.paused);
     entry.upload = upload;
     let size = 0;
     req.on('data', chunk => {

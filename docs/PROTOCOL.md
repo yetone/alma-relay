@@ -95,9 +95,13 @@ soon as the relay has the head. Then:
 The relay keeps at most 4 MiB per request un-acknowledged, so a desktop that
 reads slowly slows the phone's upload down instead of filling the relay. A
 desktop that acknowledges nothing for `STALL_TIMEOUT_S` while the relay waits
-gets `hcancel` and the phone `504`. The 120 s wait for the response head starts
-at `hreqend`. The desktop may answer before the body ends (`hres`/`hend`); the
-relay then discards the rest. A body over the limit gets `413` and `hcancel`.
+gets `hcancel` and the phone `504`. That wait pauses while the relay itself
+holds the agent socket for a slow phone — there the acks cannot have arrived —
+and resumes when the socket drains; it gives up after five such windows, so
+a request never waits on a paused socket for good. The 120 s wait for the
+response head starts at `hreqend`. The desktop may answer before the body ends
+(`hres`/`hend`); the relay then discards the rest. A body over the limit gets
+`413` and `hcancel`.
 
 On Cloudflare the edge takes in a whole request body before a Worker runs, so
 there the desktop sees the request only once the upload is done. Protocol 2

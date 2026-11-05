@@ -615,6 +615,58 @@ if (EDITION === 'node') {
 }
 
 // ---------------------------------------------------------------------------
+// Suite 5b (Node edition): a slow phone download must not fail an upload
+// ---------------------------------------------------------------------------
+if (EDITION === 'node') {
+    const STALL_S = 2;
+    const relay = await startRelay({ STALL_TIMEOUT_S: String(STALL_S) });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    let trickle;
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 2 });
+        // Phone A downloads at a trickle: its sink stays above LOW_WATER, so
+        // the agent socket stays paused and the desktop's acks go unread.
+        const slow = await new Promise((resolve, reject) => {
+            httpGet(`${base}/api/firehose?mb=32`, { agent: false }, res => {
+                res.pause();
+                resolve(res);
+            }).on('error', reject);
+        });
+        trickle = setInterval(() => {
+            if (slow.destroyed) return;
+            // Read often: the sink level has to fall between two flow ticks,
+            // or A counts as stalled and gets cut off instead of just slow.
+            slow.read(64 * 1024); // ~2.5 MB/s
+        }, 25);
+        await sleep(300); // the firehose fills the sink and pauses the socket
+        // Phone B is still uploading when the socket goes down, so its credit
+        // window runs out while the desktop's acks sit unread.
+        const up = streamingUpload(`${base}/api/upload`, 40 * 1024 * 1024);
+        await sleep((STALL_S + 1.5) * 1000 * SLACK); // long enough for the credit timer to fire
+        // Without the fix the credit timer fires while the acks are unread
+        // and B is killed with 504 even though the desktop acked everything.
+        clearInterval(trickle);
+        trickle = null;
+        slow.resume(); // drain A: the socket resumes, unread acks are processed
+        const res = await Promise.race([
+            up.response,
+            sleep(20000 * SLACK).then(() => ({ status: 'hung' })),
+        ]);
+        check('a slow download does not fail an unrelated upload', res.status === 200 && JSON.parse(res.body).sha === up.sha, `${res.status} ${res.body}`);
+        const after = await fetch(`${base}/api/health`);
+        check('…and the tunnel still works', after.status === 200, `${after.status}`);
+        agent.close();
+    } catch (e) {
+        check('suite: slow download vs upload', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        clearInterval(trickle);
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Suite 6: protocol 2 — streamed request bodies with flow control
 // ---------------------------------------------------------------------------
 if (!EXTERNAL || ARGS.includes('--protocol2')) {
