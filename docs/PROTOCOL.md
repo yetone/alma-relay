@@ -43,7 +43,7 @@ binary frames and streams request bodies.
 | both | `{t:'wmsg', id, s}` / `{t:'wmsg', id, b}` | Text / binary message. |
 | both | `{t:'wclose', id, code?, reason?}` | Close one bridged socket. |
 | agent → relay | `{t:'push', id, notifications:[{token, environment, platform?, collapseId?, pushType?, priority?, payload}]}` | Ask the relay to deliver notifications. `platform: 'android'` goes to FCM (`payload: {data:{...}}`, a data-only message); anything else goes to APNs. `pushType: 'liveactivity'` sends a Live Activity update (to `<topic>.push-type.liveactivity`); `priority: 5` sends it at low priority. |
-| relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome in frame order, or "this relay has neither an APNs nor an FCM key". A notification for a platform whose key the relay lacks comes back `{status: 0, reason: 'ApnsUnsupported' | 'FcmUnsupported'}`. |
+| relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome in frame order, or "this relay has neither an APNs nor an FCM key". A notification for a platform whose key the relay lacks comes back `{status: 0, reason: 'ApnsUnsupported' | 'FcmUnsupported'}`. A frame with more notifications than one batch holds (64) still gets an outcome for every one of them; the ones past the batch come back `{status: 0, reason: 'BatchTooLarge'}`. |
 
 In protocol 2 the desktop may also send `hchunk` and `wmsg` as binary frames,
 and the relay sends phone WebSocket messages that way; see below.
