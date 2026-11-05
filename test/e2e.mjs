@@ -418,6 +418,16 @@ if (!EXTERNAL) {
         check('right registration key registers', true);
         agent.close();
 
+        // A second register with a stale key must not take the socket down:
+        // the relay has already admitted this desktop.
+        const again = await connected({ relay: relay.origin, code: newCode(), key: KEY });
+        again.send({ t: 'register', tokenHash: createHash('sha256').update(again.opts.code).digest('hex'), key: 'nope' });
+        await sleep(300 * SLACK);
+        check('a second register with a bad key leaves the socket up', !again.closed, JSON.stringify(again.closed));
+        const tunnel = await fetch(`${again.opts.relay}/c/${again.opts.code}/api/health`);
+        check('…and the tunnel still works', tunnel.status === 200, `${tunnel.status}`);
+        again.close();
+
         const denied = await fetch(`${relay.origin}/turn`, { method: 'POST' });
         check('/turn without the key → 401', denied.status === 401, `status=${denied.status}`);
         const res = await fetch(`${relay.origin}/turn`, { method: 'POST', headers: { authorization: `Bearer ${KEY}` } });

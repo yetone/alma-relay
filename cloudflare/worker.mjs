@@ -600,9 +600,15 @@ export class TunnelDO extends DurableObject {
         }
 
         if (frame.t === 'register') {
+            // One register per socket: a second one (a retried frame) must not
+            // re-run the gate and close a socket that is already admitted.
+            if (attachment.registered || attachment.registering) return;
+            ws.serializeAttachment({ ...attachment, registering: true });
             // Access gate: a signed relay token (RELAY_TOKEN_SECRET), a shared
             // key (RELAY_REGISTRATION_KEY), or open — see shared.mjs.
             const auth = await authorize(this.env, frame.key);
+            // The socket may have gone away while the gate was checked.
+            if (ws.readyState !== WebSocket.OPEN) return;
             if (!auth.ok) {
                 ws.send(JSON.stringify({ t: 'error', message: auth.message }));
                 ws.close(auth.code, auth.reason);
