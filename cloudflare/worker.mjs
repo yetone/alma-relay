@@ -127,9 +127,12 @@ export default {
 
         // A large or chunked body: buffering it here would undo streaming to
         // the desktop, so ask the hinted tunnel whether the desktop is there
-        // and send the body only once.
+        // and send the body only once. A chunked body has no content-length
+        // and reads as 0 — without the `length > 0` it would take the buffer
+        // below, where anything over MAX_BODY dies with a 413 instead of
+        // streaming up to MAX_BODY_MB.
         const length = Number(request.headers.get('content-length'));
-        if (request.body && !(length <= SMALL_BODY)) {
+        if (request.body && !(length > 0 && length <= SMALL_BODY)) {
             const probe = await tunnel.fetch(new Request('https://tunnel/', { headers: { 'x-alma-tunnel-role': 'probe' } }));
             return (probe.headers.has(OFFLINE_HEADER) ? legacy : tunnel).fetch(clientRequest(target, request));
         }

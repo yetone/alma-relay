@@ -515,6 +515,12 @@ if (EDITION === 'cloudflare') {
         const up2 = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 8 * 1024 * 1024);
         const r2 = await up2.response;
         check('…streamed there too', r2.status === 200 && JSON.parse(r2.body).sha === up2.sha && moved.stats.streamed === 1, `${r2.status} ${r2.body}`);
+        // A chunked body carries no content-length: it has to take the probe
+        // path too, or the Worker buffers it and fails it at MAX_BODY (24 MB)
+        // instead of streaming it up to MAX_BODY_MB.
+        const big = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 30 * 1024 * 1024);
+        const bigRes = await big.response;
+        check('a chunked body over 24 MB streams under a hint', bigRes.status === 200 && JSON.parse(bigRes.body).sha === big.sha, `${bigRes.status} ${bigRes.body}`);
         moved.close();
     } catch (e) {
         check('suite: legacy tunnels', false, e.stack);
