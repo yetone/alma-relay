@@ -338,6 +338,17 @@ for (const PROTO of [1, 2]) {
             const closeCode = await Promise.race([ws.closedWith, sleep(2000 * SLACK).then(() => 'open')]);
             check('…and the close handshake completes', closeCode === 1000 || closeCode === 1005, `code=${closeCode} after ${Date.now() - t0}ms`);
         }
+        {
+            // An abnormal close: the desktop must see the phone's actual
+            // code and reason, not a hardcoded 1000.
+            const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
+            await waitFor(() => ws.messages[0] === 'hello-from-desktop');
+            const before = agent.wcloses.length;
+            ws.close(4321, 'phone-gone');
+            const got = await waitFor(() => agent.wcloses.length > before, 3000);
+            const w = agent.wcloses[before];
+            check('phone close code and reason reach the desktop', got && w?.code === 4321 && w?.reason === 'phone-gone', JSON.stringify(agent.wcloses));
+        }
         if (EDITION === 'cloudflare') {
             // `wrangler dev` fronts workerd with its own proxy, which keeps the
             // upstream request alive after the phone hangs up, so neither the

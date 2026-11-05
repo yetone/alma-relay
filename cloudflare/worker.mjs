@@ -760,7 +760,7 @@ export class TunnelDO extends DurableObject {
             this.dropTunnels('Desktop disconnected');
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
-            this.sendToAgent({ t: 'wclose', id: attachment.id, code: 1000 });
+            this.sendToAgent({ t: 'wclose', id: attachment.id, code: sanitizeCloseCode(code), reason: String(reason || '').slice(0, 120) });
         }
     }
 
