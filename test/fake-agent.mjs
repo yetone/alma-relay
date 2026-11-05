@@ -36,7 +36,7 @@ export class FakeAgent {
         const { relay, code, key } = this.opts;
         const th = tokenHashOf(code);
         return new Promise((resolve, reject) => {
-            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}${this.opts.agentQuery || ''}`, { maxPayload: 256 * 1024 * 1024 });
+            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}${this.opts.agentQuery || ''}`, { maxPayload: 32 * 1024 * 1024 }); // the documented agent-frame cap, as a real desktop enforces
             this.ws = ws;
             let settled = false;
             const settle = (fn, v) => {

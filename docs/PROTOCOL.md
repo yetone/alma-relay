@@ -48,6 +48,13 @@ binary frames and streams request bodies.
 In protocol 2 the desktop may also send `hchunk` and `wmsg` as binary frames,
 and the relay sends phone WebSocket messages that way; see below.
 
+Protocol 1 puts the payload of a request body, and of a binary phone message,
+into one base64 string inside a JSON frame, so the frame has to stay inside
+the 32 MiB an agent frame may take: the base64 of 24 MiB is already 32 MiB
+before the JSON around it. The relay therefore caps a protocol-1 request
+body at 23 MiB — past that the phone gets a `413` — and a protocol-1 binary
+phone message at the same size, closing the socket with `1009`.
+
 When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
 talking into a dead tunnel.

@@ -65,7 +65,12 @@ const PING_INTERVAL_MS = 30_000;
 // Frame caps. They match the Cloudflare edition (Durable Object messages are
 // capped at 32 MiB), so a desktop that works with one works with the other.
 const AGENT_MAX_FRAME = 32 * MB;
-const CLIENT_MAX_MESSAGE = 24 * MB; // base64 makes it at most 32 MiB in a wmsg frame
+const CLIENT_MAX_MESSAGE = 24 * MB; // phone-facing ws maxPayload
+// Protocol 1 puts request bodies and phone messages in base64 inside a JSON
+// frame, so the payload has to leave room for that JSON: base64 of 24 MiB is
+// exactly 32 MiB before a single wrapper byte. Keep protocol-1 payloads at
+// 23 MiB so the frame stays inside AGENT_MAX_FRAME on the desktop's side.
+const FRAME1_MAX = 23 * MB;
 const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its side
 // Flow control: above HIGH_WATER buffered bytes the sender is paused until
 // the buffer drains below LOW_WATER.
@@ -426,7 +431,11 @@ const server = createServer((req, res) => {
         respondJson(res, 502, { error: 'Desktop is offline or the connect code is invalid' });
         return;
     }
-    if (Number(req.headers['content-length'] || 0) > MAX_BODY) {
+    // Protocol 1 carries the body base64 inside one hreq frame; past
+    // FRAME1_MAX that frame would exceed AGENT_MAX_FRAME and the desktop
+    // would drop the connection instead of just this request.
+    const bodyCap = agent.proto >= 2 ? MAX_BODY : Math.min(MAX_BODY, FRAME1_MAX);
+    if (Number(req.headers['content-length'] || 0) > bodyCap) {
         respondJson(res, 413, { error: 'Request body too large' });
         req.resume();
         return;
@@ -459,7 +468,7 @@ const server = createServer((req, res) => {
     req.on('data', chunk => {
         if (aborted) return;
         size += chunk.length;
-        if (size > MAX_BODY) {
+        if (size > bodyCap) {
             aborted = true;
             release();
             respondJson(res, 413, { error: 'Request body too large' }, { Connection: 'close' });
@@ -874,6 +883,13 @@ function handleClientSocket(clientWs, agent, path) {
 
     clientWs.on('message', (data, isBinary) => {
         if (bridge.opened) {
+            // Protocol 1 base64s this into a wmsg frame: past FRAME1_MAX the
+            // frame would exceed what the desktop accepts, and it would drop
+            // the whole connection for one message.
+            if (agent.proto < 2 && data.length > FRAME1_MAX) {
+                clientWs.close(1009, 'Message too large for protocol 1');
+                return;
+            }
             agent.sendWs(id, data, isBinary);
             agent.throttle(clientWs);
             return;

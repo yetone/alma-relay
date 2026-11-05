@@ -37,7 +37,12 @@ import {
 
 const HEAD_TIMEOUT_MS = 120_000;
 const MB = 1024 * 1024;
-const MAX_BODY = 24 * MB; // protocol 1: keep hreq frames well under the 32 MiB DO WebSocket message cap
+// Protocol 1 base64s request bodies and phone messages into one JSON frame;
+// base64 of 24 MiB is exactly 32 MiB before the JSON around it, so keep
+// protocol-1 payloads at 23 MiB and the frame inside the DO's 32 MiB cap.
+const MAX_BODY = 23 * MB;
+const FRAME1_MAX = 23 * MB;
+const CLIENT_MAX_MESSAGE = 24 * MB; // phone WebSocket message, protocol 2
 // Below this a body is buffered in the Worker when it may have to be offered
 // to two tunnels (see legacy tunnels); above it the Worker asks first.
 const SMALL_BODY = 1 * MB;
@@ -579,7 +584,15 @@ export class TunnelDO extends DurableObject {
         const attachment = ws.deserializeAttachment() || {};
 
         if (attachment.role === 'client') {
-            // Phone -> desktop traffic on a bridged socket.
+            // Phone -> desktop traffic on a bridged socket. Protocol 1
+            // base64s this into a wmsg frame: past FRAME1_MAX the frame would
+            // exceed what the DO can send, and the agent connection dies.
+            const bytes = typeof message === 'string' ? message.length : message.byteLength;
+            const cap = this.agentProto() >= 2 ? CLIENT_MAX_MESSAGE : FRAME1_MAX;
+            if (bytes > cap) {
+                ws.close(1009, this.agentProto() >= 2 ? 'Message too large' : 'Message too large for protocol 1');
+                return;
+            }
             const queue = this.preOpenQueues.get(attachment.id);
             if (queue) queue.push(message);
             else this.sendWsToAgent(attachment.id, message);

@@ -317,6 +317,24 @@ for (const PROTO of [1, 2]) {
             const body = await (await fetch(`${base}/api/upload`, { method: 'POST', body: up })).json();
             check('3 MB upload intact', body.n === up.length && body.sha === sha(up), JSON.stringify(body));
         }
+        if (PROTO === 1) {
+            // Protocol 1 base64s bodies and phone messages into one JSON
+            // frame; past ~23 MiB that frame exceeds the desktop's 32 MiB
+            // cap and the connection dies instead of just the one request.
+            const over = await fetch(`${base}/api/upload`, { method: 'POST', body: Buffer.alloc(25 * 1024 * 1024) }).catch(e => ({ status: 0, body: String(e) }));
+            check('a protocol-1 body that would base64 past 32 MiB → 413', over.status === 413, `${over.status} ${over.body || ''}`);
+            const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+            ws.send('ping');
+            const opened = await waitFor(() => ws.messages.length > 0);
+            let code = 'never opened';
+            if (opened) {
+                ws.send(Buffer.alloc(24 * 1024 * 1024), { binary: true });
+                code = await Promise.race([ws.closedWith, sleep(5000 * SLACK).then(() => 'still open')]);
+            }
+            check('a protocol-1 phone message at the 24 MiB cap → 1009', opened && code === 1009, `opened=${opened} close=${code}`);
+            const still = await fetch(`${base}/api/health`);
+            check('…and the desktop is still connected', still.status === 200, `${still.status}`);
+        }
         {
             const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
             ws.send('queued-before-open'); // the desktop answers wopened 150 ms later
