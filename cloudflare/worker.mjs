@@ -684,6 +684,12 @@ export class TunnelDO extends DurableObject {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
                 this.pending.delete(frame.id);
+                clearTimeout(entry.timer);
+                // The desktop may end the response before it ever sent a head.
+                // The Node edition answers that with a 200 (res.end()); here
+                // the head promise would otherwise never settle - the pending
+                // entry is already gone, so the head timer cannot fire either.
+                if (!entry.headersSent) entry.headResolve?.({ status: 200, headers: {} });
                 entry.close?.();
                 entry.wake?.(); // a body still being pumped stops
                 break;

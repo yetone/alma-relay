@@ -295,6 +295,16 @@ for (const PROTO of [1, 2]) {
             check('desktop error before the head → 502', res.status === 502, `status=${res.status}`);
         }
         {
+            // The desktop ends the response without ever sending a head:
+            // that is a 200 with what it streamed, not a request that hangs.
+            const res = await Promise.race([
+                fetch(`${base}/api/no-head`),
+                sleep(10000 * SLACK).then(() => ({ status: 'hung' })),
+            ]);
+            const body = res.status === 'hung' ? '' : await res.text();
+            check('desktop ending before the head → 200', res.status === 200 && body === 'no-head-body', `${res.status} ${body}`);
+        }
+        {
             const t0 = Date.now();
             const reader = (await fetch(`${base}/api/sse`)).body.getReader();
             let first = 0;

@@ -132,6 +132,12 @@ export class FakeAgent {
         const { backendPort } = this.opts;
         switch (frame.t) {
             case 'hreq': {
+                // A test path: end the response before ever sending a head.
+                if (frame.path.startsWith('/api/no-head')) {
+                    this.sendBody(frame.id, Buffer.from('no-head-body'));
+                    this.send({ t: 'hend', id: frame.id });
+                    break;
+                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',
