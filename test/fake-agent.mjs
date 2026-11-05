@@ -29,6 +29,7 @@ export class FakeAgent {
         this.closed = null; // {code, reason} once the relay closes us
         this.errors = [];
         this.pushReplies = [];
+        this.wcloses = []; // {id, code, reason} — wclose frames from the relay
     }
 
     /** Resolves once registered; rejects with the relay's error / close. */
@@ -202,6 +203,7 @@ export class FakeAgent {
                 break;
             }
             case 'wclose': {
+                this.wcloses.push({ id: frame.id, code: frame.code, reason: frame.reason });
                 const ws = this.sockets.get(frame.id);
                 this.sockets.delete(frame.id);
                 ws?.close();
