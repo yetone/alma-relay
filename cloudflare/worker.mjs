@@ -453,7 +453,10 @@ export class TunnelDO extends DurableObject {
         for (const [key, value] of Object.entries(res.headers || {})) {
             const k = key.toLowerCase();
             if (k === 'connection' || k === 'keep-alive' || k === 'transfer-encoding' || k === 'content-length') continue;
-            resHeaders.append(key, value);
+            // A desktop sends multi-valued headers as a list (set-cookie);
+            // appending the list itself would join them into one line.
+            if (Array.isArray(value)) for (const v of value) resHeaders.append(key, v);
+            else resHeaders.append(key, value);
         }
 
         if (res.status === 204 || res.status === 304) {
@@ -461,7 +464,19 @@ export class TunnelDO extends DurableObject {
             clearTimeout(entry.timer);
             return new Response(null, { status: res.status, headers: resHeaders });
         }
-        return new Response(stream, { status: res.status, headers: resHeaders });
+        try {
+            return new Response(stream, { status: res.status, headers: resHeaders });
+        } catch {
+            // A status outside 200-599 has no web Response. The Node edition
+            // hands such a status to the phone as it is; here the phone gets
+            // the relay's own answer instead of a worker-level error.
+            this.sendToAgent({ t: 'hcancel', id });
+            this.pending.delete(id);
+            clearTimeout(entry.timer);
+            entry.close?.();
+            entry.wake?.();
+            return json(502, { error: 'Desktop sent a response status this platform cannot represent' });
+        }
     }
 
     /**
