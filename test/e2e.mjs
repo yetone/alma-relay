@@ -452,6 +452,10 @@ if (!EXTERNAL) {
             (await rejectedWith({ relay: relay.origin, code: newCode(), key: mintToken(SECRET, { sub: 'u1', aud: 'alma-relay', exp: now - 10 }) })) === 4401
         );
         check(
+            'a token whose exp is now → 4401',
+            (await rejectedWith({ relay: relay.origin, code: newCode(), key: mintToken(SECRET, { sub: 'u1', aud: 'alma-relay', exp: now }) })) === 4401
+        );
+        check(
             'token for another audience → 4401',
             (await rejectedWith({ relay: relay.origin, code: newCode(), key: mintToken(SECRET, { sub: 'u1', aud: 'other', exp: now + 600 }) })) === 4401
         );

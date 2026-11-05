@@ -138,7 +138,8 @@ export async function verifyRelayToken(token, secret) {
         if (header.alg !== 'HS256') return null;
         const claims = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1])));
         if (claims.aud !== RELAY_AUDIENCE) return null;
-        if (typeof claims.exp === 'number' && claims.exp < Math.floor(Date.now() / 1000)) return null;
+        // RFC 7519: the current time must be strictly before exp.
+        if (typeof claims.exp === 'number' && claims.exp <= Math.floor(Date.now() / 1000)) return null;
         if (!claims.sub) return null;
         return claims;
     } catch {
