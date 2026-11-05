@@ -104,6 +104,33 @@ there the desktop sees the request only once the upload is done. Protocol 2
 still lifts the 24 MB cap, keeps bodies out of Durable Object memory, and
 paces them to the desktop.
 
+## End-to-end sessions
+
+The relay parses none of what follows: the handshake and the sealed frames of
+an `alma-relay-e2e/v1` session ride inside a bridged WebSocket as opaque
+bytes. The rules below are for whoever implements the receiving end — they
+live here because the wire alone does not enforce them. The relay is the
+party E2E protects against, so a compromised one can replay, reorder or drop
+frames of an established session; a replay cannot reach past it into the next
+session, because every handshake derives fresh keys (#2).
+
+- Each direction has its own 64-bit frame counter, starting at 0. The sender
+  builds the AES-GCM IV for frame `n` as `4 zero bytes || n` (big-endian) and
+  prepends it to the ciphertext.
+- The receiver derives the IV of every incoming frame from the counter it
+  expects next and rejects a frame that does not match it. The relay's
+  transport is ordered, so a mismatch can only be a replay or a reorder;
+  taking the IV from the frame unchecked lets the relay hand back any past
+  frame, and the request it carries runs a second time.
+- A rejected frame's contents are never acted on. Whether it fails just the
+  one request behind the frame or the whole session is the client's call.
+- A drop in the middle of a stream shows up as the same mismatch on the next
+  frame; a drop with nothing after it never does, and needs the usual
+  timeouts.
+- Checked in order, a replayed inner frame dies at the session layer before
+  any `hreq`/`wopen`/`wmsg` sees it, so those ids need no separate replay
+  guard.
+
 ## HTTP endpoints
 
 | Endpoint | Purpose |
