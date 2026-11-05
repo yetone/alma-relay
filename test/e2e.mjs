@@ -330,6 +330,17 @@ for (const PROTO of [1, 2]) {
             ws.close();
         }
         {
+            // A phone that floods the relay before the desktop opens its side
+            // is cut off: the relay holds at most 4 MiB for it.
+            const slowCode = newCode();
+            const slow = await connected({ relay: relay.origin, code: slowCode, wopenDelayMs: 5000 });
+            const flood = await openPhoneSocket(`${relay.origin.replace(/^http/, 'ws')}/c/${slowCode}/ws/echo`);
+            flood.send(Buffer.alloc(5 * 1024 * 1024, 7));
+            const floodCode = await Promise.race([flood.closedWith, sleep(5000 * SLACK).then(() => 'still open')]);
+            check('too much data before the desktop opened → 1009', floodCode === 1009, String(floodCode));
+            slow.close();
+        }
+        {
             const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
             check('desktop-initiated WebSocket message', await waitFor(() => ws.messages[0] === 'hello-from-desktop'));
             const t0 = Date.now();

@@ -121,7 +121,7 @@ paces them to the desktop.
 | Waiting for the response head | 120 s | 120 s |
 | Agent frame | 32 MiB | 32 MiB |
 | Phone WebSocket message | 24 MiB | 24 MiB |
-| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
+| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | 4 MiB (then close `1009`) |
 | Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
 | Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
