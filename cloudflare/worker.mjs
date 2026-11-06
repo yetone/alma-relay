@@ -41,6 +41,8 @@ const MAX_BODY = 24 * MB; // protocol 1: keep hreq frames well under the 32 MiB 
 // Below this a body is buffered in the Worker when it may have to be offered
 // to two tunnels (see legacy tunnels); above it the Worker asks first.
 const SMALL_BODY = 1 * MB;
+// Phone bytes held while the desktop opens its side of a bridged socket.
+const OPEN_QUEUE_MAX = 4 * MB;
 
 /** A non-negative number from the environment, or the default. 0 means "no limit". */
 const limit = (value, fallback) => {
@@ -186,7 +188,8 @@ export class TunnelDO extends DurableObject {
         // In-memory only: every entry belongs to a live request/socket, and
         // the DO cannot hibernate while one is active.
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
-        this.preOpenQueues = new Map(); // client ws id -> frames queued until agent sends wopened
+        this.preOpenQueues = new Map(); // client ws id -> {frames, bytes} queued until agent sends wopened
+        this.queueKeepalive = null; // timer holding the DO awake while the queue has entries
         this.counter = 0;
         // APNs signer (see ../../apns.mjs); null when the deployment has no
         // APNS_KEY secret — the agent is then told `unsupported` and the
@@ -195,6 +198,28 @@ export class TunnelDO extends DurableObject {
         // FCM sender (see ../../fcm.mjs) from the FCM_SERVICE_ACCOUNT secret;
         // null without one. Android notifications then come back FcmUnsupported.
         this.fcm = undefined;
+    }
+
+    /**
+     * The queue lives only in this object's memory: if the DO hibernated
+     * between `wopen` and `wopened`, the frames would be gone (in-memory
+     * state does not survive a wake; a socket attachment holds at most
+     * 16 KiB). A scheduled timer is what keeps a Durable Object awake,
+     * so one runs while any queue has entries. It stops itself once the
+     * last queue is gone.
+     */
+    syncQueueKeepalive() {
+        if (this.preOpenQueues.size > 0 && !this.queueKeepalive) {
+            this.queueKeepalive = setInterval(() => {
+                if (this.preOpenQueues.size === 0) {
+                    clearInterval(this.queueKeepalive);
+                    this.queueKeepalive = null;
+                }
+            }, 60_000);
+        } else if (this.preOpenQueues.size === 0 && this.queueKeepalive) {
+            clearInterval(this.queueKeepalive);
+            this.queueKeepalive = null;
+        }
     }
 
     fcmSender() {
@@ -324,7 +349,8 @@ export class TunnelDO extends DurableObject {
         const [client, server] = Object.values(pair);
         this.ctx.acceptWebSocket(server, ['client', `c:${id}`]);
         server.serializeAttachment({ role: 'client', id });
-        this.preOpenQueues.set(id, []);
+        this.preOpenQueues.set(id, { frames: [], bytes: 0 });
+        this.syncQueueKeepalive();
         this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
         return new Response(null, { status: 101, webSocket: client });
     }
@@ -581,8 +607,24 @@ export class TunnelDO extends DurableObject {
         if (attachment.role === 'client') {
             // Phone -> desktop traffic on a bridged socket.
             const queue = this.preOpenQueues.get(attachment.id);
-            if (queue) queue.push(message);
-            else this.sendWsToAgent(attachment.id, message);
+            if (!queue) {
+                this.sendWsToAgent(attachment.id, message);
+                return;
+            }
+            queue.frames.push(message);
+            queue.bytes += typeof message === 'string' ? message.length : message.byteLength;
+            if (queue.bytes > OPEN_QUEUE_MAX) {
+                // The desktop has not opened its side yet, so the data waits
+                // in this Durable Object's memory. Cut the phone off instead
+                // of holding on to it (the Node edition closes with 1009).
+                this.preOpenQueues.delete(attachment.id);
+                const client = this.clientSocket(attachment.id);
+                try {
+                    client?.close(1009, 'Too much data before the desktop answered');
+                } catch {
+                    /* client gone */
+                }
+            }
             return;
         }
 
@@ -704,7 +746,7 @@ export class TunnelDO extends DurableObject {
             case 'wopened': {
                 const queue = this.preOpenQueues.get(String(frame.id));
                 this.preOpenQueues.delete(String(frame.id));
-                for (const queued of queue || []) this.sendWsToAgent(String(frame.id), queued);
+                for (const queued of queue?.frames || []) this.sendWsToAgent(String(frame.id), queued);
                 break;
             }
             case 'werr': {
@@ -774,6 +816,9 @@ export class TunnelDO extends DurableObject {
             this.pending.delete(id);
         }
         this.preOpenQueues.clear();
+        // The queues are gone: stop holding the DO awake for them before the
+        // sockets below are closed.
+        this.syncQueueKeepalive();
         for (const client of this.ctx.getWebSockets('client')) {
             try {
                 client.close(1012, reason);
