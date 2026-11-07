@@ -111,7 +111,7 @@ paces them to the desktop.
 | `GET /healthz` | `{ok, edition, version, protocol}` (+ `agents` on the Node edition) |
 | `GET /agent` (WebSocket) | Desktop agents register here |
 | `ANY /c/<token>/…` | Tunneled HTTP / WebSocket traffic to one desktop |
-| `POST /turn` | Short-lived TURN credentials (`Authorization: Bearer <key or relay token>` when the relay is gated); `404` if TURN is not configured |
+| `POST /turn` | Short-lived TURN credentials (`Authorization: Bearer <key or relay token>` when the relay is gated); `404` if TURN is not configured, `502` if the mint failed. Two providers: coturn's static-auth-secret (`TURN_URLS` / `TURN_SECRET`) or Cloudflare's managed TURN (`TURN_PROVIDER=cloudflare` + a TURN key) |
 
 ## Limits
 
