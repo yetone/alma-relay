@@ -177,7 +177,8 @@ export async function sendFcm(sender, notifications, fetchImpl = fetch) {
  * treat as a dead token. Results keep the frame's order.
  */
 export async function deliverPush(notifications, { sendApns, fcm, fetchImpl = fetch }) {
-    const batch = clampBatch(notifications);
+    const all = Array.isArray(notifications) ? notifications : [];
+    const batch = clampBatch(all);
     const ios = batch.filter(n => !isAndroid(n));
     const android = batch.filter(isAndroid);
     const unsupported = (list, reason) => list.map(n => ({ token: typeof n?.token === 'string' ? n.token : '', status: 0, reason }));
@@ -187,5 +188,11 @@ export async function deliverPush(notifications, { sendApns, fcm, fetchImpl = fe
     ]);
     let i = 0;
     let a = 0;
-    return batch.map(n => (isAndroid(n) ? androidResults[a++] : iosResults[i++]));
+    const results = batch.map(n => (isAndroid(n) ? androidResults[a++] : iosResults[i++]));
+    // A frame may carry more notifications than one batch holds. The rest
+    // were never sent, and the desktop still has to hear about them.
+    for (const n of all.slice(batch.length)) {
+        results.push({ token: typeof n?.token === 'string' ? n.token : '', status: 0, reason: 'BatchTooLarge' });
+    }
+    return results;
 }

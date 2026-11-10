@@ -85,7 +85,9 @@ export function validateNotification(n) {
     if (!n || typeof n !== 'object') return 'BadNotification';
     if (typeof n.token !== 'string' || !/^[0-9a-f]{64,200}$/.test(n.token)) return 'BadDeviceToken';
     if (!n.payload || typeof n.payload !== 'object') return 'PayloadEmpty';
-    if (JSON.stringify(n.payload).length > 4096) return 'PayloadTooLarge';
+    // Apple's limit is 4096 bytes; .length counts UTF-16 units, so a payload
+    // of multi-byte characters could slip past it (FCM counts bytes).
+    if (new TextEncoder().encode(JSON.stringify(n.payload)).length > 4096) return 'PayloadTooLarge';
     return null;
 }
 
