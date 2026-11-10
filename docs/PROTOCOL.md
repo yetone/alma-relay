@@ -150,7 +150,7 @@ edition had to hold whatever the desktop sent in Durable Object memory.
 | Waiting for the response head | 120 s | 120 s |
 | Agent frame | 32 MiB | 32 MiB |
 | Phone WebSocket message | 24 MiB | 24 MiB |
-| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
+| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | 4 MiB (then close `1009`) |
 | Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
 | Un-acknowledged response / WebSocket bytes (protocol 3) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) |

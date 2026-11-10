@@ -34,6 +34,7 @@ export class FakeAgent {
         this.closed = null; // {code, reason} once the relay closes us
         this.errors = [];
         this.pushReplies = [];
+        this.wcloses = []; // {id, code, reason} — wclose frames from the relay
     }
 
     /** Resolves once registered; rejects with the relay's error / close. */
@@ -90,11 +91,17 @@ export class FakeAgent {
         this.ws.send(encodeBinary(kind, id, payload));
     }
 
-    /** Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2). */
-    sendBody(id, bytes) {
+    /**
+     * Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2).
+     * With `corrupt` (protocol 1 only) the base64 payload gets characters
+     * outside the alphabet in front of it: the relay must not fall over such
+     * a frame.
+     */
+    sendBody(id, bytes, { corrupt = false } = {}) {
         if (this.proto >= 2) return this.sendBinary(BIN.HCHUNK, id, bytes);
         this.stats.jsonData++;
-        this.send({ t: 'hchunk', id, b: Buffer.from(bytes).toString('base64') });
+        const b64 = Buffer.from(bytes).toString('base64');
+        this.send({ t: 'hchunk', id, b: corrupt ? `!!!${b64}` : b64 });
     }
 
     sendWs(id, data, isBinary) {
@@ -166,6 +173,12 @@ export class FakeAgent {
         const { backendPort } = this.opts;
         switch (frame.t) {
             case 'hreq': {
+                // A test path: end the response before ever sending a head.
+                if (frame.path.startsWith('/api/no-head')) {
+                    this.sendBody(frame.id, Buffer.from('no-head-body'));
+                    this.send({ t: 'hend', id: frame.id });
+                    break;
+                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',
@@ -175,13 +188,18 @@ export class FakeAgent {
                         headers: { ...frame.headers, 'accept-encoding': 'identity' },
                     },
                     res => {
-                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
+                        // A backend that asks for it gets its body sent with a
+                        // base64 payload that is not valid base64.
+                        const corrupt = res.headers['x-alma-corrupt-base64'] !== undefined;
+                        const headers = { ...res.headers };
+                        delete headers['x-alma-corrupt-base64'];
+                        this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers });
                         // Reading stops while anything holds it: the stream's window or the relay socket.
                         const holds = new Set();
                         const hold = why => (holds.add(why), res.pause());
                         const release = why => holds.delete(why) && !holds.size && res.resume();
                         res.on('data', chunk => {
-                            this.sendBody(frame.id, chunk);
+                            this.sendBody(frame.id, chunk, { corrupt });
                             this.spent(frame.id, chunk.length, () => hold('window'), () => release('window'));
                             // Like Alma's desktop, wait for the relay socket to drain.
                             if (this.ws.bufferedAmount > 1024 * 1024 && !holds.has('socket')) {
@@ -250,6 +268,7 @@ export class FakeAgent {
                 break;
             }
             case 'wclose': {
+                this.wcloses.push({ id: frame.id, code: frame.code, reason: frame.reason });
                 const ws = this.sockets.get(frame.id);
                 this.sockets.delete(frame.id);
                 ws?.close();

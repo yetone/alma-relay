@@ -103,6 +103,12 @@ const backend = createServer((req, res) => {
         res.on('close', () => (lastSlowClosed = true));
         return;
     }
+    if (req.url === '/api/bad-b64') {
+        // Asks the desktop to send the body with a base64 payload that is
+        // not valid base64.
+        res.writeHead(200, { 'content-type': 'text/plain', 'x-alma-corrupt-base64': '1' });
+        return res.end('helloworld');
+    }
     if (req.url.startsWith('/api/firehose')) {
         // Streams `mb` MB as fast as the reader takes it, honouring backpressure.
         const total = Number(new URL(req.url, 'http://x').searchParams.get('mb') || 256) * 1024 * 1024;
@@ -132,6 +138,16 @@ const backend = createServer((req, res) => {
     if (req.url === '/api/empty') {
         res.writeHead(204);
         return res.end();
+    }
+    if (req.url === '/api/cookies') {
+        res.writeHead(200, { 'content-type': 'text/plain', 'set-cookie': ['a=1; Path=/', 'b=2; Path=/'] });
+        return res.end('cookies');
+    }
+    if (req.url === '/api/status-600') {
+        // A status the web platform cannot represent (a Response takes
+        // 200-599). Node can pass it on, a Worker cannot.
+        res.writeHead(600, { 'content-type': 'text/plain' });
+        return res.end('nope');
     }
     if (req.url === '/api/drop') {
         // The desktop's own request fails before any response head → herr.
@@ -296,8 +312,33 @@ for (const PROTO of [1, 2, 3]) {
             check('204 with no body', res.status === 204, `status=${res.status}`);
         }
         {
+            // A header the desktop sends as a list (set-cookie) must stay a
+            // list on the way out, not one comma-joined line.
+            const res = await fetch(`${base}/api/cookies`);
+            const cookies = res.headers.getSetCookie();
+            check('two Set-Cookie headers stay two headers', res.status === 200 && cookies.length === 2 && cookies[0] === 'a=1; Path=/' && cookies[1] === 'b=2; Path=/', JSON.stringify(cookies));
+        }
+        {
+            // A status outside 200-599 cannot be built into a web Response:
+            // the phone gets the relay's own answer, not a worker-level error.
+            const status = await fetch(`${base}/api/status-600`).then(r => r.status, () => 'error');
+            if (EDITION === 'cloudflare') check('a status the platform cannot represent → 502', status === 502, String(status));
+            // Node can send the status as it is.
+            else check('an unusual status passes through', status === 600, String(status));
+        }
+        {
             const res = await fetch(`${base}/api/drop`);
             check('desktop error before the head → 502', res.status === 502, `status=${res.status}`);
+        }
+        {
+            // The desktop ends the response without ever sending a head:
+            // that is a 200 with what it streamed, not a request that hangs.
+            const res = await Promise.race([
+                fetch(`${base}/api/no-head`),
+                sleep(10000 * SLACK).then(() => ({ status: 'hung' })),
+            ]);
+            const body = res.status === 'hung' ? '' : await res.text();
+            check('desktop ending before the head → 200', res.status === 200 && body === 'no-head-body', `${res.status} ${body}`);
         }
         {
             const t0 = Date.now();
@@ -335,6 +376,17 @@ for (const PROTO of [1, 2, 3]) {
             ws.close();
         }
         {
+            // A phone that floods the relay before the desktop opens its side
+            // is cut off: the relay holds at most 4 MiB for it.
+            const slowCode = newCode();
+            const slow = await connected({ relay: relay.origin, code: slowCode, wopenDelayMs: 5000 });
+            const flood = await openPhoneSocket(`${relay.origin.replace(/^http/, 'ws')}/c/${slowCode}/ws/echo`);
+            flood.send(Buffer.alloc(5 * 1024 * 1024, 7));
+            const floodCode = await Promise.race([flood.closedWith, sleep(5000 * SLACK).then(() => 'still open')]);
+            check('too much data before the desktop opened → 1009', floodCode === 1009, String(floodCode));
+            slow.close();
+        }
+        {
             const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
             check('desktop-initiated WebSocket message', await waitFor(() => ws.messages[0] === 'hello-from-desktop'));
             const t0 = Date.now();
@@ -342,6 +394,33 @@ for (const PROTO of [1, 2, 3]) {
             check('phone close reaches the desktop', await waitFor(() => agent.sockets.size === 0));
             const closeCode = await Promise.race([ws.closedWith, sleep(2000 * SLACK).then(() => 'open')]);
             check('…and the close handshake completes', closeCode === 1000 || closeCode === 1005, `code=${closeCode} after ${Date.now() - t0}ms`);
+        }
+        {
+            // An abnormal close: the desktop must see the phone's actual
+            // code and reason, not a hardcoded 1000.
+            const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
+            await waitFor(() => ws.messages[0] === 'hello-from-desktop');
+            const before = agent.wcloses.length;
+            ws.close(4321, 'phone-gone');
+            const got = await waitFor(() => agent.wcloses.length > before, 3000);
+            const w = agent.wcloses[before];
+            check('phone close code and reason reach the desktop', got && w?.code === 4321 && w?.reason === 'phone-gone', JSON.stringify(agent.wcloses));
+        }
+        {
+            // The desktop failing its own side of a socket: the phone is told,
+            // and the desktop is not told about it again (Node deletes the
+            // bridge first, so its close handler stays silent).
+            const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
+            await waitFor(() => agent.sockets.size === 1);
+            const id = [...agent.sockets.keys()][0];
+            await sleep(500 * SLACK); // let echoes of earlier phones land first
+            const before = agent.wcloses.length;
+            agent.send({ t: 'werr', id, message: 'nope' });
+            const phoneCode = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
+            await sleep(500 * SLACK); // let a spurious echo arrive
+            check('the desktop failing its side closes the phone', phoneCode === 1011, String(phoneCode));
+            const echo = agent.wcloses.slice(before).filter(w => w.id === id);
+            check('…and is not told about it again', echo.length === 0, `id=${id} ${JSON.stringify(agent.wcloses.slice(before))}`);
         }
         if (EDITION === 'cloudflare') {
             // `wrangler dev` fronts workerd with its own proxy, which keeps the
@@ -354,6 +433,16 @@ for (const PROTO of [1, 2, 3]) {
             await res.body.getReader().read();
             controller.abort();
             check('phone abort cancels the desktop request', await waitFor(() => lastSlowClosed));
+        }
+        if (PROTO === 1) {
+            // A frame with a base64 payload that is not valid base64 must not
+            // take the message handler down: the body keeps coming (Node's
+            // Buffer.from skips the characters outside the alphabet).
+            // Protocol 2 carries the body in a binary frame, so this is a
+            // protocol-1 case.
+            const res = await fetch(`${base}/api/bad-b64`);
+            const body = await res.text();
+            check('a malformed base64 chunk does not stop the body', res.status === 200 && body === 'helloworld', `${res.status} ${JSON.stringify(body)}`);
         }
         {
             const res = await fetch(`${relay.origin}/c/${'x'.repeat(43)}/api/health`);
@@ -425,6 +514,16 @@ if (!EXTERNAL) {
         const agent = await connected({ relay: relay.origin, code: newCode(), key: KEY });
         check('right registration key registers', true);
         agent.close();
+
+        // A second register with a stale key must not take the socket down:
+        // the relay has already admitted this desktop.
+        const again = await connected({ relay: relay.origin, code: newCode(), key: KEY });
+        again.send({ t: 'register', tokenHash: createHash('sha256').update(again.opts.code).digest('hex'), key: 'nope' });
+        await sleep(300 * SLACK);
+        check('a second register with a bad key leaves the socket up', !again.closed, JSON.stringify(again.closed));
+        const tunnel = await fetch(`${again.opts.relay}/c/${again.opts.code}/api/health`);
+        check('…and the tunnel still works', tunnel.status === 200, `${tunnel.status}`);
+        again.close();
 
         const denied = await fetch(`${relay.origin}/turn`, { method: 'POST' });
         check('/turn without the key → 401', denied.status === 401, `status=${denied.status}`);
@@ -523,6 +622,12 @@ if (EDITION === 'cloudflare') {
         const up2 = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 8 * 1024 * 1024);
         const r2 = await up2.response;
         check('…streamed there too', r2.status === 200 && JSON.parse(r2.body).sha === up2.sha && moved.stats.streamed === 1, `${r2.status} ${r2.body}`);
+        // A chunked body carries no content-length: it has to take the probe
+        // path too, or the Worker buffers it and fails it at MAX_BODY (24 MB)
+        // instead of streaming it up to MAX_BODY_MB.
+        const big = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 30 * 1024 * 1024);
+        const bigRes = await big.response;
+        check('a chunked body over 24 MB streams under a hint', bigRes.status === 200 && JSON.parse(bigRes.body).sha === big.sha, `${bigRes.status} ${bigRes.body}`);
         moved.close();
     } catch (e) {
         check('suite: legacy tunnels', false, e.stack);
