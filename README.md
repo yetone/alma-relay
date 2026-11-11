@@ -130,7 +130,10 @@ settings) on Cloudflare. All of them are optional.
 | `STALL_TIMEOUT_S` | Cut off a phone that reads nothing for this many seconds (Node), or a protocol-2 desktop that takes in none of an upload (both editions) (`60`). See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
 | `RELAY_PROTOCOL` | Newest protocol offered to desktops (`3`). `2` turns off [per-stream flow control](docs/PROTOCOL.md#protocol-3); `1` also turns off [protocol 2](docs/PROTOCOL.md#protocol-2) (streamed uploads, binary frames). |
 | `LOCATION_HINT` | Cloudflare only: where tunnels live, for example `apac`, `enam` or `weur`. By default a tunnel is created near the desktop. Set this when the desktop sits behind a proxy far away from the phone. Changing it moves each desktop to a new tunnel the next time it redials; phones find desktops that haven't yet. |
-| `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). |
+| `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). `TURN_PROVIDER=coturn` (the default). |
+| `TURN_PROVIDER` | `coturn` (default) or `cloudflare` — which TURN service `/turn` mints credentials from (see below). |
+| `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | A Cloudflare TURN key (dashboard → Calls), needed when `TURN_PROVIDER=cloudflare`. |
+| `TURN_API_URL` | Override the Cloudflare credentials API base. For tests; leave it unset otherwise. |
 | `APNS_KEY_FILE` or `APNS_KEY`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | Phone notifications (see below). |
 | `FCM_SERVICE_ACCOUNT_FILE` or `FCM_SERVICE_ACCOUNT` | Android phone notifications through Firebase (see below). |
 
@@ -197,6 +200,31 @@ docker compose --profile turn up -d
 Open UDP/TCP `3478` and UDP `49160-49200` in your firewall. On Cloudflare, run
 coturn somewhere else and set `TURN_URLS` / `TURN_SECRET` on the Worker. The
 relay only issues short-lived credentials. Media never passes through it.
+
+#### Cloudflare's TURN
+
+If you would rather not run coturn, the relay can mint credentials from
+Cloudflare's managed TURN instead (`turn.cloudflare.com`, anycast — free
+alongside the Realtime SFU, otherwise billed per GB outbound). Cloudflare does
+not speak coturn's static-auth-secret scheme: a TURN key cannot be used with
+`turn.cloudflare.com` directly, only through their credentials API, so a
+Cloudflare relay points at the API:
+
+1. Create a TURN key in the dashboard (Calls → TURN keys) and keep the
+   **Token ID** and **API token** server-side.
+2. Set on the Worker:
+
+   ```bash
+   TURN_PROVIDER=cloudflare
+   TURN_KEY_ID=<Token ID>
+   TURN_KEY_API_TOKEN=<API token>
+   ```
+
+The relay mints a short-lived credential per request, labels it with a
+pseudonymous id for Cloudflare's analytics, and answers `/turn` with the
+`iceServers` from the API plus the ttl it asked for. A failed mint is a `502`,
+not the `404` an unconfigured relay gives. The Node edition speaks this
+provider too, with the same variables.
 
 ## Security
 

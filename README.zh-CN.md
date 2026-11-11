@@ -94,7 +94,10 @@ npx github:yetone/alma-relay
 | `STALL_TIMEOUT_S` | 手机端这么多秒读不走任何数据就断开（Node 版）；协议 2 的桌面端这么多秒不接收上传数据也会被断开（两个版本都有）。默认 60。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
 | `RELAY_PROTOCOL` | 向桌面端提供的最高协议版本（默认 `3`）。设为 `2` 关闭[按流流控](docs/PROTOCOL.md#protocol-3)；设为 `1` 连[协议 2](docs/PROTOCOL.md#protocol-2)（流式上传、二进制帧）也关掉。 |
 | `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。改了之后，每台桌面端下次重连时会换到新区域的隧道；还没重连的，手机也照样找得到。 |
-| `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。 |
+| `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。即 `TURN_PROVIDER=coturn`（默认）。 |
+| `TURN_PROVIDER` | `coturn`（默认）或 `cloudflare`——`/turn` 从哪个 TURN 服务签发凭据（见下文）。 |
+| `TURN_KEY_ID` / `TURN_KEY_API_TOKEN` | Cloudflare 的 TURN 密钥（控制台 → Calls），`TURN_PROVIDER=cloudflare` 时必填。 |
+| `TURN_API_URL` | 覆盖 Cloudflare 凭据 API 的地址。仅供测试使用，平时不要设置。 |
 | `APNS_KEY_FILE` 或 `APNS_KEY`，以及 `APNS_KEY_ID`、`APNS_TEAM_ID`、`APNS_TOPIC` | 手机通知（见下文）。 |
 | `FCM_SERVICE_ACCOUNT_FILE` 或 `FCM_SERVICE_ACCOUNT` | 通过 Firebase 给 Android 手机发通知（见下文）。 |
 
@@ -153,9 +156,32 @@ TURN_URLS=stun:relay.example.com:3478,turn:relay.example.com:3478?transport=udp,
 docker compose --profile turn up -d
 ```
 
-防火墙需要放行 UDP/TCP `3478` 和 UDP `49160-49200`。用 Cloudflare 部署的话，
+防火墙需要放行 UDP/TCP `3478`和 UDP `49160-49200`。用 Cloudflare 部署的话，
 把 coturn 跑在别的机器上，再给 Worker 配上 `TURN_URLS` / `TURN_SECRET`。中继
 只负责签发短期凭据，音视频数据不会经过它。
+
+#### Cloudflare 的 TURN
+
+不想自己维护 coturn 的话，中继也可以改为从 Cloudflare 的托管 TURN
+（`turn.cloudflare.com`，anycast；与 Realtime SFU 搭配使用免费，否则按出站
+流量计费）签发凭据。Cloudflare 不讲 coturn 的 static-auth-secret 那套——TURN
+密钥不能直接当 `turn.cloudflare.com` 的凭据用，只能通过他们的凭据 API 兑换，
+所以 Cloudflare 上的中继是指向这个 API 的：
+
+1. 在控制台创建 TURN 密钥（Calls → TURN keys），保管好其中的 **Token ID** 和
+   **API token**，它们只应存在于服务端。
+2. 给 Worker 配上：
+
+   ```bash
+   TURN_PROVIDER=cloudflare
+   TURN_KEY_ID=<Token ID>
+   TURN_KEY_API_TOKEN=<API token>
+   ```
+
+中继会为每次请求兑换一个短期凭据，用一个不可反推的 id 标注它（用于 Cloudflare
+的用量统计），然后在 `/turn` 里返回 API 给的 `iceServers` 以及自己要求的
+ttl。兑换失败返回 `502`，和未配置时的 `404` 区分开。Node 版同样支持这个
+provider，变量相同。
 
 ## 安全
 

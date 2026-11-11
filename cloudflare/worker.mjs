@@ -100,7 +100,14 @@ export default {
             const bearer = bearerOf(request.headers.get('authorization'));
             const auth = await authorize(env, bearer);
             if (!auth.ok) return json(401, { error: auth.message });
-            const creds = await turnCredentials(env, auth.subject || bearer);
+            let creds;
+            try {
+                creds = await turnCredentials(env, auth.subject || bearer);
+            } catch {
+                // The provider is configured but the mint failed — not the same
+                // as "not configured", so not a 404.
+                return json(502, { error: 'TURN credential generation failed' });
+            }
             if (!creds) return json(404, { error: 'TURN not configured on this relay' });
             return json(200, creds);
         }

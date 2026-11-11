@@ -508,7 +508,7 @@ const server = createServer((req, res) => {
             const creds = await turnCredentials(env, auth.subject || bearerOf(req.headers.authorization));
             if (!creds) return respondJson(res, 404, { error: 'TURN not configured on this relay' });
             respondJson(res, 200, creds);
-        })().catch(() => respondJson(res, 500, { error: 'TURN credentials failed' }));
+        })().catch(() => respondJson(res, 502, { error: 'TURN credential generation failed' }));
         return;
     }
 
