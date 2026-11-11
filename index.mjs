@@ -72,13 +72,43 @@ const PING_INTERVAL_MS = 30_000;
 // Frame caps. They match the Cloudflare edition (Durable Object messages are
 // capped at 32 MiB), so a desktop that works with one works with the other.
 const AGENT_MAX_FRAME = 32 * MB;
-const CLIENT_MAX_MESSAGE = 24 * MB; // base64 makes it at most 32 MiB in a wmsg frame
+const CLIENT_MAX_MESSAGE = 24 * MB; // phone-facing ws maxPayload
+// Protocol 1 puts request bodies and phone messages in base64 inside a JSON
+// frame, so the payload has to leave room for that JSON: base64 of 24 MiB is
+// exactly 32 MiB before a single wrapper byte. Keep protocol-1 payloads at
+// 23 MiB so the frame stays inside AGENT_MAX_FRAME on the desktop's side.
+const FRAME1_MAX = 23 * MB;
 const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its side
 // Flow control: above HIGH_WATER buffered bytes the sender is paused until
 // the buffer drains below LOW_WATER.
 const HIGH_WATER = (limit(env.FLOW_HIGH_WATER_MB, 8) || 8) * MB;
 const LOW_WATER = Math.min((limit(env.FLOW_LOW_WATER_MB, 1) || 1) * MB, HIGH_WATER / 2);
 const FLOW_TICK_MS = 25;
+/**
+ * Bytes queued on one stream before the whole agent socket is paused.
+ * A protocol-3 desktop stops at the window it was offered, but the frame that
+ * crosses the line overshoots that, so the safety net has to sit above the
+ * window: pausing below it would freeze every other stream on the desktop for
+ * a phone that is merely slow (and raising `FLOW_STREAM_WINDOW_KB` — the
+ * obvious thing to try on a high-RTT link — would make it permanent).
+ */
+const pauseHigh = agent => (agent.proto >= 3 ? Math.max(HIGH_WATER, STREAM_WINDOW * 2) : HIGH_WATER);
+/**
+ * Bytes a sink has handed to the kernel but not had accepted yet, or -1 when
+ * the runtime does not expose it (the watches then fall back to the write
+ * callback alone). `writableLength` only moves when a whole `write` completes,
+ * so one frame larger than what the phone takes in STALL_TIMEOUT_S looks
+ * motionless to every watch built on it — while every byte of it is leaving.
+ * This falls as the peer reads, which is what separates "slow" from "stuck"
+ * for a large frame.
+ */
+function queuedFor(socket) {
+    const q = socket?._handle?.writeQueueSize;
+    return Number.isFinite(q) ? q : -1;
+}
+// How many stall windows an upload may sit out while the relay itself holds
+// the agent socket (a slow phone download) before it is failed anyway.
+const MAX_DEFERRALS = 5;
 // While the agent socket is paused the relay can't read the desktop's pings,
 // so it sends unsolicited pongs (RFC 6455 §5.5.3) on this interval: a desktop
 // that is being pushed back on must not take the relay for gone and redial.
@@ -204,10 +234,11 @@ class Agent {
         this.flowTimer = null;
         // Protocol 3: each stream is acknowledged as its bytes leave for the
         // phone, so the desktop holds back only the stream of a slow phone
-        // and the agent socket is never paused for it (`congested` stays as
-        // a safety net for a desktop that ignores its window).
+        // and the agent socket is not paused for it (`congested` stays as a
+        // safety net for a desktop that ignores its window, and sits above
+        // the window so it never fires on a conforming one).
         this.acks = proto >= 3 ? new AckBatcher((id, n) => this.send({ t: 'ack', id, n })) : null;
-        /** key -> {n, since, gone, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
+        /** key -> {n, since, last, gone, progress, kill}: protocol-3 bytes handed to a phone sink, not yet written out */
         this.owed = new Map();
         this.stallTimer = null;
     }
@@ -217,12 +248,17 @@ class Agent {
      * Returns the write callback that acknowledges them to the desktop once
      * they are written out (undefined below protocol 3). A sink that writes
      * none of what it owes for STALL_MS is cut off with `kill()`.
+     * `progress()` is the sink's bytes still on their way to the kernel (or -1
+     * once it is gone): a counter that keeps falling means the phone is taking
+     * data, so a stream is not stalled even though a single large frame has
+     * not finished writing yet.
      */
-    deliver(id, key, n, gone, kill) {
+    deliver(id, key, n, gone, progress, kill) {
         if (!this.acks) return undefined;
         let debt = this.owed.get(key);
         if (!debt) {
-            debt = { n: 0, since: Date.now(), gone, kill };
+            // `last` starts at Infinity so the first check counts as progress.
+            debt = { n: 0, since: Date.now(), last: Infinity, gone, progress, kill };
             this.owed.set(key, debt);
             if (STALL_MS && !this.stallTimer) this.stallTimer = setInterval(() => this.checkStalls(), Math.min(1000, STALL_MS / 2));
         }
@@ -242,7 +278,19 @@ class Agent {
         for (const [key, debt] of this.owed) {
             if (debt.gone()) {
                 this.owed.delete(key);
-            } else if (now - debt.since > STALL_MS) {
+                continue;
+            }
+            const moved = debt.progress();
+            if (moved >= 0) {
+                // Bytes left the sink since the last check: the stream is
+                // moving. Without this a phone draining one huge frame for
+                // longer than STALL_MS is cut off mid-transfer, because the
+                // write it is waiting on cannot complete until the frame is
+                // entirely out.
+                if (moved < debt.last) debt.since = now;
+                debt.last = moved;
+            }
+            if (now - debt.since > STALL_MS) {
                 console.log(`[relay] agent ${this.tag}: ${key} wrote nothing for ${STALL_MS / 1000}s with ${mb(debt.n)} owed; cut off`);
                 this.owed.delete(key);
                 try {
@@ -296,16 +344,19 @@ class Agent {
     }
 
     /**
-     * A phone sink has more than HIGH_WATER bytes queued. `level()` returns
-     * its buffered bytes, or -1 once it is gone; `kill()` cuts it off when it
-     * drains nothing for STALL_MS.
+     * A phone sink has more than `high` bytes queued. `level()` returns
+     * its buffered bytes, or -1 once it is gone; `progress()` returns the
+     * bytes still on their way to the kernel — the counter that keeps falling
+     * while a large frame leaves for a slow phone, when `level()` cannot move
+     * until a whole write completes. `kill()` cuts it off when it drains
+     * nothing for STALL_MS.
      */
-    congested(key, level, kill) {
-        if (!this.sinks.has(key)) this.sinks.set(key, { level, kill, last: level(), since: Date.now() });
+    congested(key, level, kill, high = HIGH_WATER, progress = level) {
+        if (!this.sinks.has(key)) this.sinks.set(key, { level, progress, kill, last: level(), moved: progress(), since: Date.now() });
         if (!this.paused) {
             this.paused = true;
             this.ws.pause();
-            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false };
+            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false, high };
             this.keepAlive(this.pause.since);
         }
         this.startFlow();
@@ -329,10 +380,18 @@ class Agent {
             const level = sink.level();
             if (level < LOW_WATER) {
                 this.sinks.delete(key);
-            } else if (level < sink.last) {
-                sink.last = level;
-                sink.since = now;
-            } else if (STALL_MS && now - sink.since > STALL_MS) {
+                continue;
+            }
+            // Either the sink's own queue shrank, or its bytes reached the
+            // kernel: both mean the phone is taking data. `level` alone cannot
+            // move until a whole write completes, so one large frame for a
+            // slow phone would otherwise look stalled the whole time.
+            const moved = sink.progress();
+            const moving = moved < sink.moved || level < sink.last;
+            sink.moved = moved;
+            sink.last = level;
+            if (moving) sink.since = now;
+            else if (STALL_MS && now - sink.since > STALL_MS) {
                 console.log(`[relay] agent ${this.tag}: ${key} drained nothing for ${STALL_MS / 1000}s with ${mb(level)} queued; cut off`);
                 this.sinks.delete(key);
                 try {
@@ -350,7 +409,7 @@ class Agent {
             this.keepAlive(now);
             if (!this.pause.logged && now - this.pause.since >= PAUSE_LOG_MS) {
                 this.pause.logged = true;
-                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(HIGH_WATER)})`);
+                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(this.pause.high)})`);
             }
         }
         if (this.waiting.size && (this.ws.bufferedAmount < LOW_WATER || this.ws.readyState !== WebSocket.OPEN)) {
@@ -400,13 +459,15 @@ class Agent {
  * anything holds it: no credit left, or a backed-up agent socket.
  */
 class Upload {
-    constructor(req, onStall) {
+    constructor(req, onStall, deferred) {
         this.req = req;
         this.onStall = onStall;
+        this.deferred = deferred; // () => the relay itself is holding the socket
         this.credit = BODY_WINDOW;
         this.holds = new Set();
         this.done = false;
         this.stallTimer = null;
+        this.deferrals = 0; // stall windows the relay's own backpressure used up
     }
 
     hold(reason) {
@@ -432,7 +493,23 @@ class Upload {
         this.credit -= n;
         if (this.credit > 0 || this.holds.has('credit')) return;
         this.hold('credit');
-        if (STALL_MS) this.stallTimer = setTimeout(() => this.onStall(), STALL_MS);
+        this.armStall();
+    }
+
+    armStall() {
+        if (!STALL_MS) return;
+        this.stallTimer = setTimeout(() => {
+            // The relay may be the reason no ack arrives: a paused agent
+            // socket (a slow phone download) leaves the desktop's hack
+            // frames unread, so credit cannot refill through it. Look again
+            // after another window instead of blaming the desktop — but not
+            // forever, a request may not wait on a paused socket for good.
+            if (this.deferrals < MAX_DEFERRALS && this.deferred?.()) {
+                this.deferrals++;
+                return this.armStall();
+            }
+            this.onStall();
+        }, STALL_MS);
     }
 
     refund(n) {
@@ -523,7 +600,11 @@ const server = createServer((req, res) => {
         respondJson(res, 502, { error: 'Desktop is offline or the connect code is invalid' });
         return;
     }
-    if (Number(req.headers['content-length'] || 0) > MAX_BODY) {
+    // Protocol 1 carries the body base64 inside one hreq frame; past
+    // FRAME1_MAX that frame would exceed AGENT_MAX_FRAME and the desktop
+    // would drop the connection instead of just this request.
+    const bodyCap = agent.proto >= 2 ? MAX_BODY : Math.min(MAX_BODY, FRAME1_MAX);
+    if (Number(req.headers['content-length'] || 0) > bodyCap) {
         respondJson(res, 413, { error: 'Request body too large' });
         req.resume();
         return;
@@ -556,7 +637,7 @@ const server = createServer((req, res) => {
     req.on('data', chunk => {
         if (aborted) return;
         size += chunk.length;
-        if (size > MAX_BODY) {
+        if (size > bodyCap) {
             aborted = true;
             release();
             respondJson(res, 413, { error: 'Request body too large' }, { Connection: 'close' });
@@ -672,7 +753,7 @@ function streamRequest(agent, req, res, path) {
         return;
     }
 
-    const upload = new Upload(req, () => fail(504, 'Desktop stopped reading the request body'));
+    const upload = new Upload(req, () => fail(504, 'Desktop stopped reading the request body'), () => agent.paused);
     entry.upload = upload;
     let size = 0;
     req.on('data', chunk => {
@@ -680,7 +761,13 @@ function streamRequest(agent, req, res, path) {
         if (!live()) return upload.stop(); // the desktop already answered, or gave up
         size += chunk.length;
         if (size > MAX_BODY) {
-            res.setHeader('Connection', 'close');
+            // No `Connection: close` here, for two reasons. The desktop may
+            // have answered already (hres), so the head is on the wire and
+            // setHeader would throw ERR_HTTP_HEADERS_SENT out of this
+            // listener and take the process down. And closing the socket
+            // with the reply cuts the upload short, so a phone still
+            // uploading sees EPIPE instead of the status — the non-streamed
+            // path above already answers without it.
             fail(413, 'Request body too large');
             dropAfterReply(req, res);
             return;
@@ -936,17 +1023,20 @@ function writeResponseBody(agent, id, bytes) {
     const entry = agent.http.get(id);
     if (!entry) return;
     const { res } = entry;
+    const level = () => (res.destroyed ? -1 : res.writableLength);
+    const progress = () => (res.destroyed ? -1 : queuedFor(res.socket));
     const kill = () => {
         agent.http.delete(id);
         agent.send({ t: 'hcancel', id });
         res.destroy();
     };
-    const written = agent.deliver(id, `h:${id}`, bytes.length, () => res.destroyed, kill);
+    const written = agent.deliver(id, `h:${id}`, bytes.length, () => res.destroyed, progress, kill);
     try {
         res.write(bytes, written);
     } catch {}
-    if (res.writableLength > HIGH_WATER) {
-        agent.congested(`h:${id}`, () => (res.destroyed ? -1 : res.writableLength), kill);
+    const high = pauseHigh(agent);
+    if (res.writableLength > high) {
+        agent.congested(`h:${id}`, level, kill, high, progress);
     }
 }
 
@@ -955,12 +1045,15 @@ function sendToPhone(agent, id, data, isBinary) {
     const bridge = agent.sockets.get(id);
     if (!bridge || bridge.client.readyState !== WebSocket.OPEN) return;
     const { client } = bridge;
+    const level = () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1);
+    const progress = () => (client.readyState === WebSocket.OPEN ? queuedFor(client._socket) : -1);
     const kill = () => client.terminate(); // its close handler tells the desktop
     const size = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
-    const sent = agent.deliver(id, `w:${id}`, size, () => client.readyState !== WebSocket.OPEN, kill);
+    const sent = agent.deliver(id, `w:${id}`, size, () => client.readyState !== WebSocket.OPEN, progress, kill);
     client.send(data, { binary: isBinary }, sent);
-    if (client.bufferedAmount > HIGH_WATER) {
-        agent.congested(`w:${id}`, () => (client.readyState === WebSocket.OPEN ? client.bufferedAmount : -1), kill);
+    const high = pauseHigh(agent);
+    if (client.bufferedAmount > high) {
+        agent.congested(`w:${id}`, level, kill, high, progress);
     }
 }
 
@@ -972,6 +1065,13 @@ function handleClientSocket(clientWs, agent, path) {
 
     clientWs.on('message', (data, isBinary) => {
         if (bridge.opened) {
+            // Protocol 1 base64s this into a wmsg frame: past FRAME1_MAX the
+            // frame would exceed what the desktop accepts, and it would drop
+            // the whole connection for one message.
+            if (agent.proto < 2 && data.length > FRAME1_MAX) {
+                clientWs.close(1009, 'Message too large for protocol 1');
+                return;
+            }
             agent.sendWs(id, data, isBinary);
             agent.throttle(clientWs);
             return;

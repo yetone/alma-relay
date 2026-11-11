@@ -41,7 +41,7 @@ export class FakeAgent {
         const { relay, code, key } = this.opts;
         const th = tokenHashOf(code);
         return new Promise((resolve, reject) => {
-            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}${this.opts.agentQuery || ''}`, { maxPayload: 256 * 1024 * 1024 });
+            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}${this.opts.agentQuery || ''}`, { maxPayload: 32 * 1024 * 1024 }); // the documented agent-frame cap, as a real desktop enforces
             this.ws = ws;
             let settled = false;
             const settle = (fn, v) => {
@@ -176,11 +176,17 @@ export class FakeAgent {
                     },
                     res => {
                         this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
+                        // `oneChunk` buffers the body and answers with a single
+                        // frame, deliberately past the window: a desktop that
+                        // replies with one huge `hchunk` is what the relay's
+                        // protocol-3 stall watch has to survive.
+                        const one = this.opts.oneChunk ? [] : null;
                         // Reading stops while anything holds it: the stream's window or the relay socket.
                         const holds = new Set();
                         const hold = why => (holds.add(why), res.pause());
                         const release = why => holds.delete(why) && !holds.size && res.resume();
                         res.on('data', chunk => {
+                            if (one) return void one.push(chunk);
                             this.sendBody(frame.id, chunk);
                             this.spent(frame.id, chunk.length, () => hold('window'), () => release('window'));
                             // Like Alma's desktop, wait for the relay socket to drain.
@@ -197,6 +203,7 @@ export class FakeAgent {
                         res.on('end', () => {
                             this.http.delete(frame.id);
                             this.forget(frame.id);
+                            if (one) this.sendBody(frame.id, Buffer.concat(one));
                             this.send({ t: 'hend', id: frame.id });
                         });
                     }
