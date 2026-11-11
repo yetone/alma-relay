@@ -173,6 +173,22 @@ export function sanitizeCloseCode(code) {
     return 1000;
 }
 
+/**
+ * A WebSocket close frame carries at most 125 bytes, two of them the status
+ * code, so the reason has to fit in 123 UTF-8 bytes. A longer one makes
+ * `close()` throw — and a throw that a `try` block only ignores leaves the
+ * socket open for good. Cut the reason to `max` bytes, on a character
+ * boundary.
+ */
+export function closeReason(reason, max = 120) {
+    const text = String(reason ?? '');
+    const bytes = enc.encode(text);
+    if (bytes.length <= max) return text;
+    let end = max;
+    while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--; // a continuation byte
+    return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
 // ---------------------------------------------------------------------------
 // Signed relay tokens (optional, for running one relay for many users).
 //

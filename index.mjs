@@ -32,6 +32,7 @@ import {
     VERSION,
     authorize,
     bearerOf,
+    closeReason,
     decodeBinary,
     encodeBinary,
     isTokenHash,
@@ -830,9 +831,13 @@ function handleAgent(ws) {
                 }
                 break;
             }
-            case 'hchunk':
-                writeResponseBody(agent, frame.id, Buffer.from(frame.b || '', 'base64'));
+            case 'hchunk': {
+                // Only a base64 string is a body. Anything else must not take
+                // the relay down: one bad desktop would drop every phone.
+                if (typeof frame.b !== 'string') break;
+                writeResponseBody(agent, frame.id, Buffer.from(frame.b, 'base64'));
                 break;
+            }
             case 'hack': {
                 agent.http.get(frame.id)?.upload?.refund(Number(frame.n));
                 break;
@@ -891,7 +896,10 @@ function handleAgent(ws) {
                 if (!bridge) return;
                 agent.sockets.delete(frame.id);
                 try {
-                    bridge.client.close(sanitizeCloseCode(frame.code), String(frame.reason || '').slice(0, 120));
+                    // The reason has to fit in a close frame: a longer one
+                    // makes close() throw, and the phone's socket would stay
+                    // open for good.
+                    bridge.client.close(sanitizeCloseCode(frame.code), closeReason(frame.reason));
                 } catch {}
                 break;
             }

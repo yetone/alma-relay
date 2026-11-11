@@ -41,7 +41,7 @@ binary frames and streams request bodies.
 | relay → agent | `{t:'wopen', id, path}` | A phone opened a WebSocket. |
 | agent → relay | `{t:'wopened', id}` / `{t:'werr', id, message}` | The relay queues the phone's messages until `wopened`. |
 | both | `{t:'wmsg', id, s}` / `{t:'wmsg', id, b}` | Text / binary message. |
-| both | `{t:'wclose', id, code?, reason?}` | Close one bridged socket. |
+| both | `{t:'wclose', id, code?, reason?}` | Close one bridged socket. A reason too long for a close frame (123 bytes) is cut. |
 | agent → relay | `{t:'push', id, notifications:[{token, environment, platform?, collapseId?, pushType?, priority?, payload}]}` | Ask the relay to deliver notifications. `platform: 'android'` goes to FCM (`payload: {data:{...}}`, a data-only message); anything else goes to APNs. `pushType: 'liveactivity'` sends a Live Activity update (to `<topic>.push-type.liveactivity`); `priority: 5` sends it at low priority. |
 | relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome in frame order, or "this relay has neither an APNs nor an FCM key". A notification for a platform whose key the relay lacks comes back `{status: 0, reason: 'ApnsUnsupported' | 'FcmUnsupported'}`. |
 

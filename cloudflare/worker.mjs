@@ -26,6 +26,7 @@ import {
     b64decode,
     b64encode,
     bearerOf,
+    closeReason,
     decodeBinary,
     encodeBinary,
     isTokenHash,
@@ -694,7 +695,10 @@ export class TunnelDO extends DurableObject {
             case 'hchunk': {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
-                entry.enqueue?.(b64decode(frame.b || ''));
+                // Only a base64 string is a body: a malformed frame must not
+                // throw out of the handler (which would reset the tunnel).
+                if (typeof frame.b !== 'string') return;
+                entry.enqueue?.(b64decode(frame.b));
                 break;
             }
             case 'hack': {
@@ -764,7 +768,9 @@ export class TunnelDO extends DurableObject {
         const client = this.clientSocket(id);
         if (!client) return;
         try {
-            client.close(code, reason);
+            // The reason has to fit in a close frame: a longer one makes
+            // close() throw, and the phone's socket would stay open for good.
+            client.close(code, closeReason(reason));
         } catch {
             /* ignore */
         }
@@ -775,7 +781,7 @@ export class TunnelDO extends DurableObject {
         // close frame for us, and until we close our end the peer sits in
         // CLOSING until the edge drops the TCP connection (~10 s, code 1006).
         try {
-            ws.close(sanitizeCloseCode(code), String(reason || '').slice(0, 120));
+            ws.close(sanitizeCloseCode(code), closeReason(reason));
         } catch {
             /* already closed */
         }
