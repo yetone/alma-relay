@@ -96,6 +96,12 @@ relay.example.com {
 
 Check it with `curl https://relay.example.com/healthz`.
 
+### Option D: RepoCloud
+
+One click deploys the relay on RepoCloud:
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Alma%20Relay/)
+
 ## Connect Alma
 
 1. On the desktop, open **Settings → Remote Access**.
