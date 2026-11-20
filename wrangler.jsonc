@@ -21,6 +21,7 @@
         //   TURN_SECRET             coturn static-auth-secret
         //
         // "LOCATION_HINT": "apac",
+        // "AGENT_RECONNECT_GRACE_S": "10", // hold phone sockets through a desktop redial
         // "MAX_BODY_MB": "100",      // uploads to protocol-2 desktops
         // "RELAY_PROTOCOL": "1",     // stop offering protocol 2
         // "TURN_URLS": "stun:turn.example.com:3478,turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp",

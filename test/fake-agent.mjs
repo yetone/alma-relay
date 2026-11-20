@@ -29,11 +29,14 @@ export class FakeAgent {
         // While true, request body bytes are neither written nor acknowledged.
         this.holdBodies = false;
         this.held = [];
+        // Responses the backend asked to be sent with a broken base64 body.
+        this.corruptIds = new Set();
         this.http = new Map();
         this.sockets = new Map();
         this.closed = null; // {code, reason} once the relay closes us
         this.errors = [];
         this.pushReplies = [];
+        this.wcloses = []; // {id, code, reason} — wclose frames from the relay
     }
 
     /** Resolves once registered; rejects with the relay's error / close. */
@@ -90,11 +93,17 @@ export class FakeAgent {
         this.ws.send(encodeBinary(kind, id, payload));
     }
 
-    /** Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2). */
+    /**
+     * Response body bytes, as hchunk JSON (protocol 1) or HCHUNK (2).
+     * A response the backend asked to be corrupted (protocol 1 only) gets
+     * characters outside the base64 alphabet in front of the payload: the
+     * relay must not fall over such a frame.
+     */
     sendBody(id, bytes) {
         if (this.proto >= 2) return this.sendBinary(BIN.HCHUNK, id, bytes);
         this.stats.jsonData++;
-        this.send({ t: 'hchunk', id, b: Buffer.from(bytes).toString('base64') });
+        const b64 = Buffer.from(bytes).toString('base64');
+        this.send({ t: 'hchunk', id, b: this.corruptIds.has(id) ? `!!!${b64}` : b64 });
     }
 
     sendWs(id, data, isBinary) {
@@ -162,8 +171,21 @@ export class FakeAgent {
         for (const fn of held) fn();
     }
 
+    /**
+     * Test paths the desktop answers itself, without the backend. Kept out of
+     * the frame switch so the switch stays a plain dispatch.
+     */
+    handleTestPath(frame) {
+        if (!frame.path.startsWith('/api/no-head')) return false;
+        this.sendBody(frame.id, Buffer.from('no-head-body'));
+        this.send({ t: 'hend', id: frame.id });
+        return true;
+    }
+
     onFrame(frame) {
         const { backendPort } = this.opts;
+        // Test paths the desktop answers itself, without the backend.
+        if (frame.t === 'hreq' && this.handleTestPath(frame)) return;
         switch (frame.t) {
             case 'hreq': {
                 const req = httpRequest(
@@ -175,6 +197,12 @@ export class FakeAgent {
                         headers: { ...frame.headers, 'accept-encoding': 'identity' },
                     },
                     res => {
+                        // A backend that asks for it gets its body sent with a
+                        // base64 payload that is not valid base64.
+                        if (res.headers['x-alma-corrupt-base64'] !== undefined) {
+                            this.corruptIds.add(frame.id);
+                            delete res.headers['x-alma-corrupt-base64'];
+                        }
                         this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
                         // Reading stops while anything holds it: the stream's window or the relay socket.
                         const holds = new Set();
@@ -250,6 +278,7 @@ export class FakeAgent {
                 break;
             }
             case 'wclose': {
+                this.wcloses.push({ id: frame.id, code: frame.code, reason: frame.reason });
                 const ws = this.sockets.get(frame.id);
                 this.sockets.delete(frame.id);
                 ws?.close();
@@ -263,5 +292,11 @@ export class FakeAgent {
 
     close() {
         this.ws?.close();
+    }
+
+    /** Kill the connection with no close frame: the relay sees 1006, the
+     * abrupt death a flaky path produces. */
+    drop() {
+        this.ws?.terminate();
     }
 }

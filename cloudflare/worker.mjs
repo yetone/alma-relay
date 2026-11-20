@@ -43,12 +43,22 @@ const MAX_BODY = 24 * MB; // protocol 1: keep hreq frames well under the 32 MiB 
 // Below this a body is buffered in the Worker when it may have to be offered
 // to two tunnels (see legacy tunnels); above it the Worker asks first.
 const SMALL_BODY = 1 * MB;
+// Phone bytes held while the desktop opens its side of a bridged socket.
+const OPEN_QUEUE_MAX = 4 * MB;
 
 /** A non-negative number from the environment, or the default. 0 means "no limit". */
 const limit = (value, fallback) => {
     const n = Number(value);
     return value !== undefined && value !== '' && Number.isFinite(n) && n >= 0 ? n : fallback;
 };
+// How long bridged phone sockets are held open after the agent socket dies,
+// waiting for the desktop to redial (see agentDown). 0 = close them at once.
+const agentGraceMs = env => limit(env.AGENT_RECONNECT_GRACE_S, 10) * 1000;
+// A close the desktop asked for (1000 normal, 1001 going away) means it is
+// gone on purpose and will not redial by itself. A connection that died
+// without a close frame (1006 — the proxy path is the common case) is worth
+// waiting for: the desktop redials within seconds.
+const deliberateClose = code => code === 1000 || code === 1001;
 // Protocol 2 streams request bodies, so they are capped by MAX_BODY_MB (and
 // by your plan's request size limit: 100 MB on Free and Pro), not by DO
 // message size.
@@ -57,7 +67,25 @@ const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
-const sleep = ms => new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms));
+/**
+ * The next result of `read`, or TIMEOUT after COALESCE_MS. The window's
+ * timer is cleared whichever side wins: pumpBody races every coalesced read
+ * against this, and a buffered body answers `read` in microtasks, so one
+ * uncleared 10 ms timer per iteration would exhaust workerd's 10 000 active
+ * timers mid-upload — the pump throws, the phone gets a spurious 400, and
+ * the connection dies reading a body after the response was sent.
+ */
+const readWithin = async read => {
+    let handle;
+    const windowed = new Promise(resolve => {
+        handle = setTimeout(() => resolve(TIMEOUT), COALESCE_MS);
+    });
+    try {
+        return await Promise.race([read, windowed]);
+    } finally {
+        clearTimeout(handle);
+    }
+};
 
 function concatBytes(parts, length) {
     const out = new Uint8Array(length);
@@ -129,9 +157,12 @@ export default {
 
         // A large or chunked body: buffering it here would undo streaming to
         // the desktop, so ask the hinted tunnel whether the desktop is there
-        // and send the body only once.
+        // and send the body only once. A chunked body has no content-length
+        // and reads as 0 — without the `length > 0` it would take the buffer
+        // below, where anything over MAX_BODY dies with a 413 instead of
+        // streaming up to MAX_BODY_MB.
         const length = Number(request.headers.get('content-length'));
-        if (request.body && !(length <= SMALL_BODY)) {
+        if (request.body && !(length > 0 && length <= SMALL_BODY)) {
             const probe = await tunnel.fetch(new Request('https://tunnel/', { headers: { 'x-alma-tunnel-role': 'probe' } }));
             return (probe.headers.has(OFFLINE_HEADER) ? legacy : tunnel).fetch(clientRequest(target, request));
         }
@@ -188,7 +219,9 @@ export class TunnelDO extends DurableObject {
         // In-memory only: every entry belongs to a live request/socket, and
         // the DO cannot hibernate while one is active.
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
-        this.preOpenQueues = new Map(); // client ws id -> frames queued until agent sends wopened
+        this.preOpenQueues = new Map(); // client ws id -> {frames, bytes} queued until agent sends wopened
+        this.queueKeepalive = null; // timer holding the DO awake while the queue has entries
+        this.agentGraceTimer = null; // armed while phone sockets wait for the desktop to redial
         this.counter = 0;
         // Protocol 3: response body / WebSocket bytes acknowledged per stream.
         this.acks = new AckBatcher((id, n) => this.sendToAgent({ t: 'ack', id, n }));
@@ -199,6 +232,28 @@ export class TunnelDO extends DurableObject {
         // FCM sender (see ../../fcm.mjs) from the FCM_SERVICE_ACCOUNT secret;
         // null without one. Android notifications then come back FcmUnsupported.
         this.fcm = undefined;
+    }
+
+    /**
+     * The queue lives only in this object's memory: if the DO hibernated
+     * between `wopen` and `wopened`, the frames would be gone (in-memory
+     * state does not survive a wake; a socket attachment holds at most
+     * 16 KiB). A scheduled timer is what keeps a Durable Object awake,
+     * so one runs while any queue has entries. It stops itself once the
+     * last queue is gone.
+     */
+    syncQueueKeepalive() {
+        if (this.preOpenQueues.size > 0 && !this.queueKeepalive) {
+            this.queueKeepalive = setInterval(() => {
+                if (this.preOpenQueues.size === 0) {
+                    clearInterval(this.queueKeepalive);
+                    this.queueKeepalive = null;
+                }
+            }, 60_000);
+        } else if (this.preOpenQueues.size === 0 && this.queueKeepalive) {
+            clearInterval(this.queueKeepalive);
+            this.queueKeepalive = null;
+        }
     }
 
     fcmSender() {
@@ -290,6 +345,10 @@ export class TunnelDO extends DurableObject {
 
     /** A phone WebSocket message (string or ArrayBuffer), in the form the agent speaks. */
     sendWsToAgent(id, message) {
+        // The desktop is done with this socket (it answered wclose or werr):
+        // the phone must not reach it any more.
+        const client = this.clientSocket(id);
+        if (client && (client.deserializeAttachment() || {}).agentClosed) return;
         const isBinary = typeof message !== 'string';
         if (this.agentProto() >= 2) {
             return this.sendBinaryToAgent(isBinary ? BIN.WBIN : BIN.WTEXT, id, isBinary ? new Uint8Array(message) : message);
@@ -320,16 +379,31 @@ export class TunnelDO extends DurableObject {
 
     acceptClientSocket(request) {
         const agent = this.agentSocket();
-        if (!agent) return offline();
+        // No desktop — but one may be mid-redial inside the grace window.
+        // Hold the socket (queued like any pre-wopen phone) and bridge it
+        // when the desktop registers; without the grace it is refused now.
+        if (!agent && !this.agentGraceTimer) return offline();
+
+        // The Node edition caps the bridged sockets one desktop may have
+        // (MAX_SOCKETS_PER_AGENT, refused with 503 at the door). Without a
+        // cap here a token holder keeps opening sockets until the Durable
+        // Object's own limits stop them — and during a redial every held
+        // socket carries a pre-open queue as well.
+        const cap = limit(this.env.MAX_SOCKETS_PER_AGENT, 256);
+        if (cap && this.ctx.getWebSockets('client').length >= cap) {
+            return json(503, { error: 'Too many WebSockets on this relay' });
+        }
 
         const url = new URL(request.url);
         const id = this.nextId('w');
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
         this.ctx.acceptWebSocket(server, ['client', `c:${id}`]);
-        server.serializeAttachment({ role: 'client', id });
-        this.preOpenQueues.set(id, []);
-        this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
+        // `path` is what a redialled desktop is re-sent (rebindClients).
+        server.serializeAttachment({ role: 'client', id, path: url.pathname + url.search });
+        this.preOpenQueues.set(id, { frames: [], bytes: 0 });
+        this.syncQueueKeepalive();
+        if (agent) this.sendToAgent({ t: 'wopen', id, path: url.pathname + url.search });
         return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -359,6 +433,17 @@ export class TunnelDO extends DurableObject {
             if (k === 'host' || k === 'connection' || k === 'content-length' || k === 'accept-encoding' || k.startsWith('x-alma-tunnel') || k.startsWith('cf-'))
                 continue;
             headers[k] = value;
+        }
+
+        // The Node edition caps the concurrent requests one desktop may have
+        // (MAX_REQUESTS_PER_AGENT, refused with 503 at the door). The pending
+        // entries are exactly the requests in flight here: one per phone
+        // request, dropped when the response ends, fails or is cancelled.
+        // The check and the set below are adjacent, so no request can slip
+        // past the cap while another one is admitted.
+        const requestCap = limit(this.env.MAX_REQUESTS_PER_AGENT, 256);
+        if (requestCap && this.pending.size >= requestCap) {
+            return json(503, { error: 'Too many concurrent requests to this desktop' });
         }
 
         const entry = {
@@ -476,7 +561,10 @@ export class TunnelDO extends DurableObject {
         for (const [key, value] of Object.entries(res.headers || {})) {
             const k = key.toLowerCase();
             if (k === 'connection' || k === 'keep-alive' || k === 'transfer-encoding' || k === 'content-length') continue;
-            resHeaders.append(key, value);
+            // A desktop sends multi-valued headers as a list (set-cookie);
+            // appending the list itself would join them into one line.
+            if (Array.isArray(value)) for (const v of value) resHeaders.append(key, v);
+            else resHeaders.append(key, value);
         }
 
         if (res.status === 204 || res.status === 304) {
@@ -484,7 +572,19 @@ export class TunnelDO extends DurableObject {
             clearTimeout(entry.timer);
             return new Response(null, { status: res.status, headers: resHeaders });
         }
-        return new Response(stream, { status: res.status, headers: resHeaders });
+        try {
+            return new Response(stream, { status: res.status, headers: resHeaders });
+        } catch {
+            // A status outside 200-599 has no web Response. The Node edition
+            // hands such a status to the phone as it is; here the phone gets
+            // the relay's own answer instead of a worker-level error.
+            this.sendToAgent({ t: 'hcancel', id });
+            this.pending.delete(id);
+            clearTimeout(entry.timer);
+            entry.close?.();
+            entry.wake?.();
+            return json(502, { error: 'Desktop sent a response status this platform cannot represent' });
+        }
     }
 
     /**
@@ -535,7 +635,7 @@ export class TunnelDO extends DurableObject {
         let read = reader.read();
         try {
             for (;;) {
-                const next = pendingBytes ? await Promise.race([read, sleep(COALESCE_MS)]) : await read;
+                const next = pendingBytes ? await readWithin(read) : await read;
                 if (next === TIMEOUT) {
                     if (!(await flush())) return giveUp();
                     continue;
@@ -606,8 +706,24 @@ export class TunnelDO extends DurableObject {
         if (attachment.role === 'client') {
             // Phone -> desktop traffic on a bridged socket.
             const queue = this.preOpenQueues.get(attachment.id);
-            if (queue) queue.push(message);
-            else this.sendWsToAgent(attachment.id, message);
+            if (!queue) {
+                this.sendWsToAgent(attachment.id, message);
+                return;
+            }
+            queue.frames.push(message);
+            queue.bytes += typeof message === 'string' ? message.length : message.byteLength;
+            if (queue.bytes > OPEN_QUEUE_MAX) {
+                // The desktop has not opened its side yet, so the data waits
+                // in this Durable Object's memory. Cut the phone off instead
+                // of holding on to it (the Node edition closes with 1009).
+                this.preOpenQueues.delete(attachment.id);
+                const client = this.clientSocket(attachment.id);
+                try {
+                    client?.close(1009, 'Too much data before the desktop answered');
+                } catch {
+                    /* client gone */
+                }
+            }
             return;
         }
 
@@ -625,9 +741,15 @@ export class TunnelDO extends DurableObject {
         }
 
         if (frame.t === 'register') {
+            // One register per socket: a second one (a retried frame) must not
+            // re-run the gate and close a socket that is already admitted.
+            if (attachment.registered || attachment.registering) return;
+            ws.serializeAttachment({ ...attachment, registering: true });
             // Access gate: a signed relay token (RELAY_TOKEN_SECRET), a shared
             // key (RELAY_REGISTRATION_KEY), or open — see shared.mjs.
             const auth = await authorize(this.env, frame.key);
+            // The socket may have gone away while the gate was checked.
+            if (ws.readyState !== WebSocket.OPEN) return;
             if (!auth.ok) {
                 ws.send(JSON.stringify({ t: 'error', message: auth.message }));
                 ws.close(auth.code, auth.reason);
@@ -663,15 +785,16 @@ export class TunnelDO extends DurableObject {
                 }
             }
             // Every bridged phone socket was paired with a responder on the
-            // previous agent connection, which the desktop has torn down. Left
-            // open, the phone keeps sending into a socket id the new agent has
-            // never heard of: the edge still answers its pings, so it never
-            // redials, and every request times out (Node edition: Agent.destroy).
-            if (replaced) this.dropTunnels('Desktop reconnected');
+            // previous agent connection, which the desktop has torn down.
+            // Instead of closing the phones (which they read as "reconnect"),
+            // hold them for the grace window and re-bridge them to this
+            // agent below (Node edition: Agent.destroy closes them at once).
+            if (replaced) this.agentDown('Desktop reconnected');
             const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
             ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
             ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: streamWindow(this.env.FLOW_STREAM_WINDOW_KB) } : {}) }));
             if (account) console.log(`[relay] agent registered for account ${account}`);
+            this.rebindClients();
             return;
         }
 
@@ -708,6 +831,12 @@ export class TunnelDO extends DurableObject {
             case 'hend': {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
+                clearTimeout(entry.timer);
+                // The desktop may end the response before it ever sent a head.
+                // The Node edition answers that with a 200 (res.end()); here
+                // the head promise would otherwise never settle - the pending
+                // entry is already gone, so the head timer cannot fire either.
+                if (!entry.headersSent) entry.headResolve?.({ status: 200, headers: {} });
                 this.pending.delete(frame.id);
                 entry.close?.();
                 entry.wake?.(); // a body still being pumped stops
@@ -729,11 +858,12 @@ export class TunnelDO extends DurableObject {
             case 'wopened': {
                 const queue = this.preOpenQueues.get(String(frame.id));
                 this.preOpenQueues.delete(String(frame.id));
-                for (const queued of queue || []) this.sendWsToAgent(String(frame.id), queued);
+                for (const queued of queue?.frames || []) this.sendWsToAgent(String(frame.id), queued);
                 break;
             }
             case 'werr': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.markAgentClosed(String(frame.id));
                 this.closeClientSocket(String(frame.id), 1011, 'Desktop could not open the socket');
                 break;
             }
@@ -750,6 +880,7 @@ export class TunnelDO extends DurableObject {
             }
             case 'wclose': {
                 this.preOpenQueues.delete(String(frame.id));
+                this.markAgentClosed(String(frame.id));
                 this.closeClientSocket(String(frame.id), sanitizeCloseCode(frame.code), String(frame.reason || ''));
                 break;
             }
@@ -770,6 +901,23 @@ export class TunnelDO extends DurableObject {
         }
     }
 
+    /**
+     * The desktop is done with this socket: when the phone's close event
+     * arrives, the relay must not send a `wclose` back for a socket the
+     * desktop itself just closed or failed to open (Node deletes its bridge
+     * first, so its close handler stays silent for these).
+     */
+    markAgentClosed(id) {
+        const client = this.clientSocket(id);
+        if (!client) return;
+        try {
+            // Keep `path`: the attachment is replaced wholesale.
+            client.serializeAttachment({ ...client.deserializeAttachment(), agentClosed: true });
+        } catch {
+            /* gone */
+        }
+    }
+
     async webSocketClose(ws, code, reason) {
         // Finish the close handshake: the runtime does not answer the peer's
         // close frame for us, and until we close our end the peer sits in
@@ -781,26 +929,96 @@ export class TunnelDO extends DurableObject {
         }
         const attachment = ws.deserializeAttachment() || {};
         if (attachment.role === 'agent' && attachment.registered) {
-            // Desktop went away: fail in-flight requests, drop bridged sockets.
-            this.dropTunnels('Desktop disconnected');
+            // Desktop went away: fail in-flight requests, then hold the
+            // bridged sockets for a redial — but only if the connection died
+            // rather than being closed on purpose; a deliberate close means
+            // the desktop is gone (AGENT_RECONNECT_GRACE_S=0 closes them at
+            // once either way).
+            this.agentDown('Desktop disconnected', { hold: !deliberateClose(code) });
         } else if (attachment.role === 'client') {
             this.preOpenQueues.delete(attachment.id);
-            this.sendToAgent({ t: 'wclose', id: attachment.id, code: 1000 });
+            this.syncQueueKeepalive();
+            if (!attachment.agentClosed) this.sendToAgent({ t: 'wclose', id: attachment.id, code: sanitizeCloseCode(code), reason: String(reason || '').slice(0, 120) });
         }
+    }
+
+    /** Fail every in-flight HTTP request with 502 (it cannot survive a redial). */
+    failPending(message) {
+        for (const [id, entry] of this.pending) {
+            clearTimeout(entry.timer);
+            entry.wake?.();
+            if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message });
+            else entry.fail?.(message);
+            this.pending.delete(id);
+        }
+    }
+
+    /**
+     * The agent socket is gone. In-flight HTTP dies with it — the request
+     * body was already handed to the old connection — but a desktop whose
+     * network path blipped (1006 through a proxy is the common case) redials
+     * within seconds, so bridged phone WebSockets are held: their frames
+     * queue exactly like pre-`wopen` ones, and rebindClients() pairs them
+     * with the redialled agent. If it does not come back within
+     * AGENT_RECONNECT_GRACE_S, dropTunnels() closes the phones with 1012.
+     * `hold: false` is a deliberate close (1000): the desktop left on
+     * purpose, so the phones are dropped at once, like the Node edition.
+     */
+    agentDown(reason, { hold = true } = {}) {
+        this.failPending('Desktop disconnected from relay');
+        const grace = hold ? agentGraceMs(this.env) : 0;
+        if (!grace) return this.dropTunnels(reason);
+        for (const client of this.ctx.getWebSockets('client')) {
+            const att = client.deserializeAttachment() || {};
+            // `path` missing: never wopen-able. agentClosed: the desktop
+            // itself ended this socket; the phone is being closed anyway.
+            if (att.role !== 'client' || att.path === undefined || att.agentClosed) continue;
+            // Keep an existing queue (frames sent since the drop, or since
+            // the wopen): agentDown can run twice for one redial — the close
+            // event first, then the replacement path of the new register.
+            if (!this.preOpenQueues.has(att.id)) this.preOpenQueues.set(att.id, { frames: [], bytes: 0 });
+        }
+        this.syncQueueKeepalive();
+        // Protocol-3 acks owed to the old connection would inflate the next
+        // agent's per-stream counts: its streams start at zero.
+        this.acks.clear();
+        clearTimeout(this.agentGraceTimer);
+        // The timer is what keeps this Durable Object awake to deliver the
+        // drop (see syncQueueKeepalive).
+        this.agentGraceTimer = setTimeout(() => {
+            this.agentGraceTimer = null;
+            this.dropTunnels(reason);
+        }, grace);
+    }
+
+    /** A registered agent: re-send `wopen` for every phone socket waiting on one. */
+    rebindClients() {
+        clearTimeout(this.agentGraceTimer);
+        this.agentGraceTimer = null;
+        if (this.preOpenQueues.size === 0) return;
+        for (const id of [...this.preOpenQueues.keys()]) {
+            const client = this.clientSocket(id);
+            const att = client?.deserializeAttachment() || {};
+            if (!client || att.role !== 'client' || att.agentClosed) {
+                this.preOpenQueues.delete(id);
+                continue;
+            }
+            this.sendToAgent({ t: 'wopen', id, path: att.path });
+        }
+        this.syncQueueKeepalive();
     }
 
     /** Fail in-flight requests and close every bridged phone socket. */
     dropTunnels(reason) {
-        for (const [id, entry] of this.pending) {
-            clearTimeout(entry.timer);
-            entry.wake?.();
-            if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message: 'Desktop disconnected from relay' });
-            else entry.fail?.('Desktop disconnected from relay');
-            this.pending.delete(id);
-        }
+        this.failPending('Desktop disconnected from relay');
         this.preOpenQueues.clear();
+        // The queues are gone: stop holding the DO awake for them before the
+        // sockets below are closed.
+        this.syncQueueKeepalive();
         for (const client of this.ctx.getWebSockets('client')) {
             try {
+                const att = client.deserializeAttachment() || {};
+                if (att.role === 'client') client.serializeAttachment({ ...att, agentClosed: true });
                 client.close(1012, reason);
             } catch {
                 /* ignore */

@@ -123,11 +123,12 @@ settings) on Cloudflare. All of them are optional.
 | `MAX_BODY_MB` | Request-body cap in MB (Node: `128`. Cloudflare: `100` for desktops on protocol 2, a fixed 24 for older ones). |
 | `MAX_BUFFERED_MB` | Node: cap on all request bodies held in memory at once, in MB (`512`); over it, `503`. Bodies to protocol-2 desktops are streamed and don't count. |
 | `MAX_AGENTS` | Node: most desktops at once (`10000`). |
-| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node: concurrent HTTP requests / WebSockets per desktop (`256` each). |
+| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Concurrent HTTP requests / bridged WebSockets per desktop (`256` each). Both editions apply both caps and refuse with `503`. |
 | `MAX_CONNECTIONS` | Node: TCP connection cap for the process (unset: no cap). |
 | `FLOW_STREAM_WINDOW_KB` | Protocol-3 desktops: how many KB of one stream a desktop may send ahead of the relay (`1024`). A slow phone then holds back only its own stream. See [protocol 3](docs/PROTOCOL.md#protocol-3). |
 | `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Node: stop reading a desktop once one of its phones has this much queued, and read again below the low mark (`8` / `1`). A safety net for protocol-3 desktops. See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
 | `STALL_TIMEOUT_S` | Cut off a phone that reads nothing for this many seconds (Node), or a protocol-2 desktop that takes in none of an upload (both editions) (`60`). See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
+| `AGENT_RECONNECT_GRACE_S` | Cloudflare only: seconds bridged phone sockets are held after the desktop's connection dies unexpectedly, so a desktop that redials through a network blip re-bridges them instead of the phones seeing a reconnect. A desktop that closed its socket deliberately is dropped at once, and `0` closes them at once always, like the Node edition (`10`). |
 | `RELAY_PROTOCOL` | Newest protocol offered to desktops (`3`). `2` turns off [per-stream flow control](docs/PROTOCOL.md#protocol-3); `1` also turns off [protocol 2](docs/PROTOCOL.md#protocol-2) (streamed uploads, binary frames). |
 | `LOCATION_HINT` | Cloudflare only: where tunnels live, for example `apac`, `enam` or `weur`. By default a tunnel is created near the desktop. Set this when the desktop sits behind a proxy far away from the phone. Changing it moves each desktop to a new tunnel the next time it redials; phones find desktops that haven't yet. |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). |

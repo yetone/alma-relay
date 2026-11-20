@@ -52,6 +52,22 @@ When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
 talking into a dead tunnel.
 
+The Cloudflare edition distinguishes how the connection ended. One that died
+without a close frame (`1006` — the network path blipped) is worth waiting
+out: the desktop usually redials within seconds, so the relay holds the
+bridged phone sockets for `AGENT_RECONNECT_GRACE_S` seconds (default `10`)
+and re-sends `wopen` for each still-open one on the new connection, so the
+phone's WebSocket survives the desktop's reconnect. Phone frames sent while
+no desktop is connected queue as before `wopened` (same 4 MiB cap) and are
+flushed once the new connection answers `wopened`; sockets the phone opens
+during the window are held the same way. Only when the grace expires without
+a redial are the phones closed with `1012`. A desktop that closed its socket
+deliberately (`1000`) has left on purpose: the relay closes the phones at
+once, as above (`AGENT_RECONNECT_GRACE_S=0` makes every close behave that
+way). A desktop must treat each `wopen` as self-contained: after a redial the
+relay re-uses a socket id on a fresh connection, whose local side is to be
+opened anew.
+
 ## Protocol 2
 
 Relay ≥ 1.2.0. Negotiated per agent socket, so every pairing keeps working:
@@ -150,12 +166,12 @@ edition had to hold whatever the desktop sent in Durable Object memory.
 | Waiting for the response head | 120 s | 120 s |
 | Agent frame | 32 MiB | 32 MiB |
 | Phone WebSocket message | 24 MiB | 24 MiB |
-| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
+| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | 4 MiB (then close `1009`) |
 | Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
 | Un-acknowledged response / WebSocket bytes (protocol 3) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) |
 | Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
-| Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | — |
+| Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) |
 | Registering | within 10 s of connecting | — |
 
 ## Flow control (Node edition)

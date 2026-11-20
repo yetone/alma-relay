@@ -145,7 +145,15 @@ export function b64encode(bytes) {
 }
 
 export function b64decode(text) {
-    const binary = atob(text);
+    // Node's Buffer.from(b, 'base64') skips characters outside the alphabet
+    // instead of failing, so a malformed frame must not throw here either -
+    // on the wire that would take down the whole message handler.
+    let binary;
+    try {
+        binary = atob(String(text).replace(/[^A-Za-z0-9+/=]/g, ''));
+    } catch {
+        binary = ''; // same as Node for input that decodes to nothing
+    }
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
