@@ -43,7 +43,7 @@ binary frames and streams request bodies.
 | both | `{t:'wmsg', id, s}` / `{t:'wmsg', id, b}` | Text / binary message. |
 | both | `{t:'wclose', id, code?, reason?}` | Close one bridged socket. |
 | agent → relay | `{t:'push', id, notifications:[{token, environment, platform?, collapseId?, pushType?, priority?, payload}]}` | Ask the relay to deliver notifications. `platform: 'android'` goes to FCM (`payload: {data:{...}}`, a data-only message); anything else goes to APNs. `pushType: 'liveactivity'` sends a Live Activity update (to `<topic>.push-type.liveactivity`); `priority: 5` sends it at low priority. |
-| relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome in frame order, or "this relay has neither an APNs nor an FCM key". A notification for a platform whose key the relay lacks comes back `{status: 0, reason: 'ApnsUnsupported' | 'FcmUnsupported'}`. |
+| relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome in frame order, or "this relay has neither an APNs nor an FCM key". A notification for a platform whose key the relay lacks comes back `{status: 0, reason: 'ApnsUnsupported' | 'FcmUnsupported'}`. A frame with more notifications than one batch holds (64) still gets an outcome for every one of them; the ones past the batch come back `{status: 0, reason: 'BatchTooLarge'}`. |
 
 In protocol 2 the desktop may also send `hchunk` and `wmsg` as binary frames,
 and the relay sends phone WebSocket messages that way; see below.
@@ -132,6 +132,33 @@ So a phone that stops reading holds back only its own stream. Before protocol
 3 the Node edition had to stop reading the whole agent socket for it (below),
 stalling every other phone and tunnel on that desktop; and the Cloudflare
 edition had to hold whatever the desktop sent in Durable Object memory.
+
+## End-to-end sessions
+
+The relay parses none of what follows: the handshake and the sealed frames of
+an `alma-relay-e2e/v1` session ride inside a bridged WebSocket as opaque
+bytes. The rules below are for whoever implements the receiving end — they
+live here because the wire alone does not enforce them. The relay is the
+party E2E protects against, so a compromised one can replay, reorder or drop
+frames of an established session; a replay cannot reach past it into the next
+session, because every handshake derives fresh keys (#2).
+
+- Each direction has its own 64-bit frame counter, starting at 0. The sender
+  builds the AES-GCM IV for frame `n` as `4 zero bytes || n` (big-endian) and
+  prepends it to the ciphertext.
+- The receiver derives the IV of every incoming frame from the counter it
+  expects next and rejects a frame that does not match it. The relay's
+  transport is ordered, so a mismatch can only be a replay or a reorder;
+  taking the IV from the frame unchecked lets the relay hand back any past
+  frame, and the request it carries runs a second time.
+- A rejected frame's contents are never acted on. Whether it fails just the
+  one request behind the frame or the whole session is the client's call.
+- A drop in the middle of a stream shows up as the same mismatch on the next
+  frame; a drop with nothing after it never does, and needs the usual
+  timeouts.
+- Checked in order, a replayed inner frame dies at the session layer before
+  any `hreq`/`wopen`/`wmsg` sees it, so those ids need no separate replay
+  guard.
 
 ## HTTP endpoints
 

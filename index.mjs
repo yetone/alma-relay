@@ -48,6 +48,8 @@ const PORT = Number(env.PORT || 8787);
 const HOST = env.HOST || '0.0.0.0';
 const MB = 1024 * 1024;
 const mb = bytes => `${(bytes / MB).toFixed(1)} MB`;
+/** Bytes for a log line: B under a kB, then kB, then MB. */
+const sizeOf = n => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} kB` : mb(n));
 /** A non-negative number from the environment, or the default. 0 means "no limit". */
 const limit = (value, fallback) => {
     const n = Number(value);
@@ -594,7 +596,7 @@ const server = createServer((req, res) => {
             }
         }, HEAD_TIMEOUT_MS);
 
-        agent.http.set(id, { res, headSent: false, timer });
+        agent.http.set(id, { res, headSent: false, timer, declared: 0, sent: 0 });
 
         res.on('close', () => {
             if (agent.http.has(id)) {
@@ -637,7 +639,7 @@ function tunneledHeaders(req) {
 function streamRequest(agent, req, res, path) {
     const hasBody = Number(req.headers['content-length'] || 0) > 0 || req.headers['transfer-encoding'] !== undefined;
     const id = agent.id('h');
-    const entry = { res, headSent: false, timer: null, upload: null };
+    const entry = { res, headSent: false, timer: null, upload: null, declared: 0, sent: 0 };
     agent.http.set(id, entry);
     const live = () => agent.http.get(id) === entry;
 
@@ -818,6 +820,11 @@ function handleAgent(ws) {
                 delete headers.connection;
                 delete headers['keep-alive'];
                 delete headers['transfer-encoding'];
+                // What the desktop's head promises: hend compares against it,
+                // so a response that under-delivers its content-length is
+                // logged instead of silently truncating the phone's stream.
+                const declared = Number(headers['content-length'] || 0);
+                entry.declared = Number.isFinite(declared) && declared > 0 ? declared : 0;
                 try {
                     entry.res.writeHead(frame.status || 200, headers);
                     entry.res.flushHeaders();
@@ -842,6 +849,13 @@ function handleAgent(ws) {
                 if (!entry) return;
                 agent.http.delete(frame.id);
                 entry.upload?.stop(); // the desktop is done, whether or not it read the whole body
+                // A desktop that ends the response short of the content-length
+                // it declared truncates the phone's stream here: no error, no
+                // close code, nothing the phone can act on. Log it, or this
+                // class of failure is invisible on both sides.
+                if (entry.declared > 0 && entry.sent < entry.declared) {
+                    console.log(`[relay] agent ${agent.tag}: response ${frame.id} ended after ${sizeOf(entry.sent)} of the ${sizeOf(entry.declared)} it declared; the phone's stream is short`);
+                }
                 try {
                     entry.res.end();
                 } catch {}
@@ -856,6 +870,9 @@ function handleAgent(ws) {
                 if (!entry.headSent) {
                     respondJson(entry.res, 502, { error: frame.message || 'Upstream error' });
                 } else {
+                    // The head is already out: the phone's response is
+                    // destroyed on the spot, with no trace at the relay.
+                    console.log(`[relay] agent ${agent.tag}: desktop failed response ${frame.id} after ${sizeOf(entry.sent)} of body (${String(frame.message || 'herr').slice(0, 120)}); the phone's response is destroyed`);
                     entry.res.destroy();
                 }
                 break;
@@ -935,6 +952,7 @@ function onBinaryFrame(agent, data) {
 function writeResponseBody(agent, id, bytes) {
     const entry = agent.http.get(id);
     if (!entry) return;
+    entry.sent += bytes.length; // what the head promised, versus this (see hend)
     const { res } = entry;
     const kill = () => {
         agent.http.delete(id);

@@ -87,11 +87,12 @@ npx github:yetone/alma-relay
 | `MAX_BODY_MB` | 请求体上限，单位 MB（Node 版默认 128；Cloudflare 版对协议 2 的桌面端默认 100，对旧桌面端固定为 24）。 |
 | `MAX_BUFFERED_MB` | Node 版：同时缓存在内存里的请求体总量上限，单位 MB（默认 512），超出返回 `503`。发给协议 2 桌面端的请求体是流式转发的，不计入。 |
 | `MAX_AGENTS` | Node 版：同时在线的桌面端上限（默认 10000）。 |
-| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node 版：每台桌面端的并发 HTTP 请求 / WebSocket 上限（默认各 256）。 |
+| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | 每台桌面端的并发 HTTP 请求 / 已桥接的 WebSocket 上限（默认各 256）。两个版本都会执行这两个上限，超出时返回 `503`。 |
 | `MAX_CONNECTIONS` | Node 版：进程的 TCP 连接上限（默认不限）。 |
 | `FLOW_STREAM_WINDOW_KB` | 协议 3 的桌面端：每条流最多领先 relay 多少 KB（默认 1024）。这样慢的手机只会拖住自己那条流。见[协议 3](docs/PROTOCOL.md#protocol-3)。 |
 | `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Node 版：某个手机端积压到这么多 MB 时暂停读取对应桌面端，降到低水位以下再恢复。默认 8 / 1。对协议 3 的桌面端只是兜底。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
 | `STALL_TIMEOUT_S` | 手机端这么多秒读不走任何数据就断开（Node 版）；协议 2 的桌面端这么多秒不接收上传数据也会被断开（两个版本都有）。默认 60。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
+| `AGENT_RECONNECT_GRACE_S` | 仅 Cloudflare：桌面端的连接意外断开后，已桥接的手机端 socket 还会保持多久（秒）。桌面端经历网络抖动后重新拨号时，会把这些连接重新桥接起来，而不是让手机端看到一次重连。桌面端主动关闭的 socket 立即释放；设为 `0` 则一律立即释放，与 Node 版一样（默认 10）。 |
 | `RELAY_PROTOCOL` | 向桌面端提供的最高协议版本（默认 `3`）。设为 `2` 关闭[按流流控](docs/PROTOCOL.md#protocol-3)；设为 `1` 连[协议 2](docs/PROTOCOL.md#protocol-2)（流式上传、二进制帧）也关掉。 |
 | `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。改了之后，每台桌面端下次重连时会换到新区域的隧道；还没重连的，手机也照样找得到。 |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。 |

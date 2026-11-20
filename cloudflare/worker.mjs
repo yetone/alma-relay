@@ -54,6 +54,8 @@ const limit = (value, fallback) => {
 // message size.
 const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
 const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
+/** Bytes for a log line: B under a kB, then kB, then MB. */
+const sizeOf = n => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} kB` : `${(n / MB).toFixed(1)} MB`);
 const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
 const COALESCE_MS = 10;
 const TIMEOUT = Symbol('timeout');
@@ -372,6 +374,7 @@ export class TunnelDO extends DurableObject {
             wake: null, // resolves a body pump waiting for credit
             enqueued: 0, // response body bytes handed to the stream
             acked: 0, // ...and acknowledged to the desktop (protocol 3)
+            declared: 0, // content-length the desktop's head promised
         };
         this.pending.set(id, entry);
 
@@ -688,6 +691,11 @@ export class TunnelDO extends DurableObject {
                     return;
                 }
                 clearTimeout(entry.timer);
+                // What the desktop's head promises: hend compares against it,
+                // so a response that under-delivers its content-length is
+                // logged instead of silently truncating the phone's stream.
+                const declared = Number((frame.headers || {})['content-length'] || 0);
+                entry.declared = Number.isFinite(declared) && declared > 0 ? declared : 0;
                 entry.headResolve?.({ status: frame.status || 200, headers: frame.headers || {} });
                 break;
             }
@@ -709,6 +717,13 @@ export class TunnelDO extends DurableObject {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
                 this.pending.delete(frame.id);
+                // A desktop that ends the response short of the content-length
+                // it declared truncates the phone's stream here: no error, no
+                // close code, nothing the phone can act on. Log it, or this
+                // class of failure is invisible on both sides.
+                if (entry.declared > 0 && entry.enqueued < entry.declared) {
+                    console.log(`[relay] response ${frame.id} ended after ${sizeOf(entry.enqueued)} of the ${sizeOf(entry.declared)} it declared; the phone's stream is short`);
+                }
                 entry.close?.();
                 entry.wake?.(); // a body still being pumped stops
                 break;
@@ -722,6 +737,9 @@ export class TunnelDO extends DurableObject {
                 if (!entry.headersSent) {
                     entry.headResolve?.({ status: 502, error: true, message: String(frame.message || 'Upstream error') });
                 } else {
+                    // The head is already out: the phone's response is cut on
+                    // the spot, with no trace at the relay.
+                    console.log(`[relay] desktop failed response ${frame.id} after ${sizeOf(entry.enqueued)} of body (${String(frame.message || 'herr').slice(0, 120)}); the phone's response is cut`);
                     entry.fail?.(String(frame.message || 'Upstream error'));
                 }
                 break;

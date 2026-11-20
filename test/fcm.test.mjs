@@ -128,3 +128,29 @@ test('a relay with only one key answers the other platform as unsupported, not d
         { token: FCM_TOKEN, status: 200 },
     ]);
 });
+
+test('a frame with more notifications than one batch holds still answers for every token', async () => {
+    const many = Array.from({ length: 70 }, (_, i) => ({
+        token: 'a'.repeat(60) + i.toString(16).padStart(4, '0'),
+        environment: 'production',
+        payload: { aps: {} },
+    }));
+    const sent = [];
+    const results = await deliverPush(many, {
+        sendApns: async list => {
+            sent.push(...list);
+            return list.map(n => ({ token: n.token, status: 200 }));
+        },
+        fcm: null,
+    });
+    assert.equal(sent.length, 64); // one batch
+    assert.equal(results.length, 70); // every token of the frame gets an outcome
+    assert.deepEqual(
+        results.slice(0, 64).map(r => r.status),
+        Array(64).fill(200)
+    );
+    assert.deepEqual(
+        results.slice(64),
+        many.slice(64).map(n => ({ token: n.token, status: 0, reason: 'BatchTooLarge' }))
+    );
+});

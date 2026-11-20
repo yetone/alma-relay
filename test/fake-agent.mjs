@@ -166,6 +166,23 @@ export class FakeAgent {
         const { backendPort } = this.opts;
         switch (frame.t) {
             case 'hreq': {
+                // A test path: the desktop declares a content-length and then
+                // ends the response short of it. The phone's stream is
+                // truncated with nothing to see on either side.
+                if (frame.path.startsWith('/api/short-hend')) {
+                    this.send({ t: 'hres', id: frame.id, status: 200, headers: { 'content-length': '1000' } });
+                    this.sendBody(frame.id, Buffer.alloc(100, 'a'));
+                    this.send({ t: 'hend', id: frame.id });
+                    break;
+                }
+                // A test path: the desktop fails a response whose head is
+                // already out. The phone's response dies on the spot.
+                if (frame.path.startsWith('/api/herr-after-head')) {
+                    this.send({ t: 'hres', id: frame.id, status: 200, headers: { 'content-length': '1000' } });
+                    this.sendBody(frame.id, Buffer.alloc(100, 'b'));
+                    this.send({ t: 'herr', id: frame.id, message: 'the desktop gave up mid-response' });
+                    break;
+                }
                 const req = httpRequest(
                     {
                         host: '127.0.0.1',
