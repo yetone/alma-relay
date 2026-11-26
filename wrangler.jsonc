@@ -19,6 +19,8 @@
         //   APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID   phone notifications
         //   FCM_SERVICE_ACCOUNT     Firebase service-account JSON (Android notifications)
         //   TURN_SECRET             coturn static-auth-secret
+        //   TURN_PROVIDER           "coturn" (default) or "cloudflare"
+        //   TURN_KEY_ID / TURN_KEY_API_TOKEN   Cloudflare TURN key (TURN_PROVIDER=cloudflare)
         //
         // "LOCATION_HINT": "apac",
         // "MAX_BODY_MB": "100",      // uploads to protocol-2 desktops

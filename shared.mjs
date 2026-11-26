@@ -223,12 +223,23 @@ export async function authorize(env, presented) {
 }
 
 // ---------------------------------------------------------------------------
-// TURN credentials for the phone<->desktop WebRTC stream (TURN REST API, as
-// spoken by coturn's `use-auth-secret`): username "<expiry>:<id>", credential
-// = base64(HMAC-SHA1(secret, username)). The relay only mints them; media
-// never passes through it. Unset TURN_URLS / TURN_SECRET -> null (404).
+// TURN credentials for the phone<->desktop WebRTC stream. The relay only mints
+// them; media never passes through it. Two providers, picked by TURN_PROVIDER:
+//
+// coturn (default) — TURN_URLS + TURN_SECRET, the TURN REST API as spoken by
+//   coturn's `use-auth-secret`: username "<expiry>:<id>", credential
+//   = base64(HMAC-SHA1(secret, username)).
+// cloudflare — TURN_KEY_ID + TURN_KEY_API_TOKEN. Cloudflare's managed TURN
+//   does not speak that scheme (a key cannot be used with turn.cloudflare.com
+//   directly), so the relay mints a short-lived credential through its API and
+//   passes the result through.
+//
+// Both return null when the chosen provider is not configured (the endpoint
+// answers 404) and throw when it is configured but the mint failed, so the
+// endpoint can answer 502 instead of a misleading 404.
 // ---------------------------------------------------------------------------
 export async function turnCredentials(env, subject) {
+    if (String(env.TURN_PROVIDER || 'coturn').toLowerCase() === 'cloudflare') return cloudflareTurnCredentials(env, subject);
     const urls = String(env.TURN_URLS || '')
         .split(',')
         .map(s => s.trim())
@@ -242,6 +253,39 @@ export async function turnCredentials(env, subject) {
     const key = await crypto.subtle.importKey('raw', enc.encode(env.TURN_SECRET), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
     const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(username)));
     return { iceServers: [{ urls, username, credential: b64encode(mac) }], ttl, expiresAt };
+}
+
+/**
+ * Cloudflare's TURN service mints credentials through
+ * POST /v1/turn/keys/<key id>/credentials/generate-ice-servers, answered with
+ * `iceServers` ready for RTCPeerConnection — but, unlike the coturn scheme,
+ * without a ttl, so the relay adds the one it asked for. TURN_API_URL only
+ * exists for tests, which point it at a local stand-in.
+ */
+async function cloudflareTurnCredentials(env, subject) {
+    const keyId = String(env.TURN_KEY_ID || '');
+    const token = String(env.TURN_KEY_API_TOKEN || '');
+    if (!keyId || !token) return null;
+    const ttl = Math.min(86400, Math.max(300, Number(env.TURN_TTL) || 43200));
+    // The same pseudonymous id the coturn path uses: it only labels the
+    // credential in Cloudflare's analytics, it is never the account itself.
+    const id = (await sha256hex(String(subject || 'anon'))).slice(0, 12);
+    const base = String(env.TURN_API_URL || 'https://rtc.live.cloudflare.com').replace(/\/+$/, '');
+    let res;
+    try {
+        res = await fetch(`${base}/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ ttl, customIdentifier: id }),
+        });
+    } catch (err) {
+        throw new Error(`cloudflare turn api unreachable: ${err?.message || err}`);
+    }
+    if (!res.ok) throw new Error(`cloudflare turn api answered ${res.status}`);
+    const body = await res.json().catch(() => null);
+    const servers = Array.isArray(body?.iceServers) ? body.iceServers : null;
+    if (!servers || servers.length === 0) throw new Error('cloudflare turn api answered no iceServers');
+    return { iceServers: servers, ttl, expiresAt: Math.floor(Date.now() / 1000) + ttl };
 }
 
 /** Bearer value of an Authorization header. */

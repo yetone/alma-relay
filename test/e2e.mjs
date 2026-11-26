@@ -433,6 +433,86 @@ if (!EXTERNAL) {
         const ice = body?.iceServers?.[0];
         const expected = ice && createHmac('sha1', TURN_SECRET).update(ice.username).digest('base64');
         check('/turn mints coturn credentials', res.status === 200 && ice.urls.length === 2 && ice.credential === expected, JSON.stringify(body));
+
+        // TURN_PROVIDER=cloudflare: Cloudflare's managed TURN does not speak the
+        // static-auth-secret scheme (a key cannot be used with turn.cloudflare.com
+        // directly), so the relay mints credentials through their API instead.
+        // The API is stubbed on loopback; TURN_API_URL only exists for this.
+        const cfApi = createServer((req, res) => {
+            let raw = '';
+            req.on('data', d => (raw += d));
+            req.on('end', () => {
+                cfApi.seen.push({
+                    method: req.method,
+                    path: req.url,
+                    auth: req.headers.authorization,
+                    ua: req.headers['user-agent'],
+                    body: JSON.parse(raw || '{}'),
+                });
+                if (cfApi.fail) {
+                    res.writeHead(500).end('nope');
+                    return;
+                }
+                res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({
+                    iceServers: [
+                        { urls: ['stun:stun.cloudflare.com:3478'] },
+                        { urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:5349?transport=tcp'], username: 'cf-user', credential: 'cf-cred' },
+                    ],
+                }));
+            });
+        });
+        cfApi.seen = [];
+        cfApi.fail = false;
+        await new Promise(r => cfApi.listen(0, '127.0.0.1', r));
+        try {
+            const cf = await startRelay({
+                TURN_PROVIDER: 'cloudflare',
+                TURN_KEY_ID: 'key-1',
+                TURN_KEY_API_TOKEN: 'tok-1',
+                TURN_API_URL: `http://127.0.0.1:${cfApi.address().port}`,
+            });
+            try {
+                const cfRes = await fetch(`${cf.origin}/turn`, { method: 'POST' });
+                const cfBody = await cfRes.json().catch(() => null);
+                const cfIce = cfBody?.iceServers?.[1];
+                check(
+                    'TURN_PROVIDER=cloudflare: /turn passes the minted credentials through',
+                    cfRes.status === 200 && cfIce?.username === 'cf-user' && cfIce?.credential === 'cf-cred'
+                        && cfBody?.ttl === 43200 && cfBody?.expiresAt > Math.floor(Date.now() / 1000),
+                    JSON.stringify(cfBody)
+                );
+                const asked = cfApi.seen.find(s => s.path.endsWith('/credentials/generate-ice-servers'));
+                check(
+                    '…asking the API with the key token, the ttl and a pseudonymous id',
+                    asked?.method === 'POST'
+                        && asked?.auth === 'Bearer tok-1'
+                        && asked?.path === '/v1/turn/keys/key-1/credentials/generate-ice-servers'
+                        && asked?.body?.ttl === 43200
+                        && asked?.body?.customIdentifier === createHash('sha256').update('anon').digest('hex').slice(0, 12),
+                    JSON.stringify(cfApi.seen)
+                );
+                cfApi.fail = true;
+                const failed = await fetch(`${cf.origin}/turn`, { method: 'POST' });
+                check('…and a failing mint → 502', failed.status === 502, `status=${failed.status}`);
+            } catch (e) {
+                check('suite: cloudflare turn provider', false, e.stack);
+                if (cf.log) console.log(cf.log());
+            } finally {
+                cf.stop();
+            }
+            const noKey = await startRelay({ TURN_PROVIDER: 'cloudflare' });
+            try {
+                const none = await fetch(`${noKey.origin}/turn`, { method: 'POST' });
+                check('TURN_PROVIDER=cloudflare without a key → 404', none.status === 404, `status=${none.status}`);
+            } catch (e) {
+                check('suite: cloudflare turn provider, no key', false, e.stack);
+                if (noKey.log) console.log(noKey.log());
+            } finally {
+                noKey.stop();
+            }
+        } finally {
+            cfApi.close();
+        }
     } catch (e) {
         check('suite: registration key', false, e.stack);
         if (relay.log) console.log(relay.log());
