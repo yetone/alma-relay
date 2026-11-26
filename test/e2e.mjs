@@ -149,6 +149,19 @@ await new Promise(r => backend.listen(BACKEND_PORT, '127.0.0.1', r));
 // ---------------------------------------------------------------------------
 // Relay launchers
 // ---------------------------------------------------------------------------
+/** Kill a relay and everything it started. */
+function killGroup(child, signal) {
+    try {
+        process.kill(-child.pid, signal); // negative pid: the whole group
+    } catch {
+        try {
+            child.kill(signal);
+        } catch {
+            /* already gone */
+        }
+    }
+}
+
 async function startRelay(vars = {}, { main } = {}) {
     if (EXTERNAL) return { origin: EXTERNAL, stop() {} };
     const port = nextRelayPort++;
@@ -157,11 +170,19 @@ async function startRelay(vars = {}, { main } = {}) {
     if (EDITION === 'cloudflare') {
         const args = ['wrangler', 'dev', ...(main ? [main] : []), '--local', '--ip', '127.0.0.1', '--port', String(port), '--inspector-port', String(port + 1000)];
         for (const [k, v] of Object.entries(vars)) args.push('--var', `${k}:${v}`);
-        child = spawn('npx', args, { cwd: ROOT, env: { ...process.env, CI: '1', WRANGLER_SEND_METRICS: 'false' }, stdio: ['ignore', 'pipe', 'pipe'] });
+        // Its own process group: `npx wrangler` starts wrangler and workerd
+        // below it, and those outlive the wrapper.
+        child = spawn('npx', args, {
+            cwd: ROOT,
+            env: { ...process.env, CI: '1', WRANGLER_SEND_METRICS: 'false' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            detached: true,
+        });
     } else {
         child = spawn(process.execPath, [path.join(ROOT, 'index.mjs')], {
             env: { PATH: process.env.PATH, PORT: String(port), HOST: '127.0.0.1', ...vars },
             stdio: ['ignore', 'pipe', 'pipe'],
+            detached: true,
         });
     }
     let log = '';
@@ -169,11 +190,11 @@ async function startRelay(vars = {}, { main } = {}) {
     child.stderr.on('data', d => (log += d));
     for (let i = 0; i < (EDITION === 'cloudflare' ? 600 : 100); i++) {
         try {
-            if ((await fetch(`${origin}/healthz`)).ok) return { origin, log: () => log, stop: () => child.kill('SIGTERM') };
+            if ((await fetch(`${origin}/healthz`)).ok) return { origin, log: () => log, stop: () => killGroup(child, 'SIGTERM') };
         } catch {}
         await sleep(100);
     }
-    child.kill('SIGKILL');
+    killGroup(child, 'SIGKILL');
     throw new Error(`relay did not start:\n${log}`);
 }
 
